@@ -1,0 +1,11 @@
+{
+  "rpc_host": "127.0.0.1",
+  "rpc_port": 10567,
+  "rpc_user": "a952c1bebef738a1fef00ea0e9995bdf",
+  "rpc_password": "254d82d43aa805b613833e6459de545a6faeac66798e45c21149f249c5d4b2e7",
+  "payout_address": "caps1qnk3y2kyfv07r832h63a0ug84z3354vgqyk9lzl",
+  "stratum_port": 10333,
+  "dashboard_port": 8080,
+  "difficulty": 0.001,
+  "poll_interval": 15
+}
