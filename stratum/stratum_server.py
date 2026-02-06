@@ -872,7 +872,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CAPS Stratum Mining Server</title>
+<title>C.A.P.S. S.M.S.D. - Vault-Tec Mining Terminal</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet">
 <style>
@@ -956,6 +956,14 @@ body::before {
   letter-spacing: 4px;
   text-shadow: var(--pip-glow), 0 0 20px rgba(20, 254, 23, 0.2);
   color: var(--pip-green);
+}
+
+.header .header-acronym {
+  font-size: 10px;
+  letter-spacing: 2px;
+  color: var(--pip-green-dim);
+  margin-top: 4px;
+  margin-bottom: 8px;
 }
 
 .header .subtitle {
@@ -1182,7 +1190,8 @@ tbody tr:hover {
 <body>
 <div class="container">
   <div class="header">
-    <h1>CAPS STRATUM MINING SERVER</h1>
+    <h1>C.A.P.S. S.M.S.D.</h1>
+    <div class="header-acronym">Cryptocurrency Acquisition & Processing System - Stratum Mining Services Dashboard</div>
     <div class="subtitle">BLOCK HEIGHT: <span id="blockHeight">---</span> | PORT: <span id="stratumPort">---</span></div>
   </div>
 
@@ -1682,7 +1691,9 @@ class StratumServer:
 
     async def start(self):
         log.info("=" * 60)
-        log.info("Caps Stratum Mining Server")
+        log.info("C.A.P.S. S.M.S.D.")
+        log.info("Cryptocurrency Acquisition & Processing System")
+        log.info("Stratum Mining Services Dashboard")
         log.info("=" * 60)
         log.info("Payout address: %s", self.payout_address)
         log.info("Default difficulty: %s", self.default_difficulty)
