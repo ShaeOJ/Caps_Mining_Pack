@@ -1177,6 +1177,70 @@ tbody tr:hover {
   font-style: italic;
 }
 
+/* Block Found Notification */
+.block-notification {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%) scale(0);
+  background: var(--pip-bg);
+  border: 3px solid var(--pip-green);
+  padding: 30px 50px;
+  z-index: 10000;
+  text-align: center;
+  box-shadow: 0 0 50px rgba(20, 254, 23, 0.5), inset 0 0 30px rgba(20, 254, 23, 0.1);
+  animation: blockFoundPop 3s ease-out forwards;
+}
+
+.block-notification::before {
+  content: '';
+  position: absolute;
+  top: -3px; left: -3px; right: -3px; bottom: -3px;
+  border: 1px solid var(--pip-green-dim);
+  pointer-events: none;
+}
+
+.block-notification .vault-icon {
+  font-size: 48px;
+  margin-bottom: 10px;
+  animation: iconPulse 0.5s ease-in-out infinite alternate;
+}
+
+.block-notification h2 {
+  font-family: 'Orbitron', sans-serif;
+  font-size: 24px;
+  letter-spacing: 4px;
+  color: var(--pip-green);
+  text-shadow: var(--pip-glow);
+  margin-bottom: 10px;
+}
+
+.block-notification .block-height {
+  font-family: 'Orbitron', sans-serif;
+  font-size: 36px;
+  color: var(--pip-amber);
+  text-shadow: 0 0 10px rgba(255, 193, 7, 0.5);
+}
+
+.block-notification .worker-name {
+  font-size: 14px;
+  color: var(--pip-green-dim);
+  margin-top: 10px;
+}
+
+@keyframes blockFoundPop {
+  0% { transform: translate(-50%, -50%) scale(0); opacity: 0; }
+  15% { transform: translate(-50%, -50%) scale(1.1); opacity: 1; }
+  25% { transform: translate(-50%, -50%) scale(1); }
+  75% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+  100% { transform: translate(-50%, -50%) scale(0.8); opacity: 0; }
+}
+
+@keyframes iconPulse {
+  from { text-shadow: 0 0 10px rgba(20, 254, 23, 0.5); }
+  to { text-shadow: 0 0 30px rgba(20, 254, 23, 0.9), 0 0 50px rgba(20, 254, 23, 0.5); }
+}
+
 /* Responsive */
 @media (max-width: 700px) {
   .stats-bar { grid-template-columns: repeat(2, 1fr); }
@@ -1465,6 +1529,13 @@ async function refresh() {
     document.getElementById('statMiners').textContent = d.stats.miners;
     document.getElementById('statAccepted').textContent = d.stats.accepted.toLocaleString();
     document.getElementById('statBlocks').textContent = d.stats.blocks;
+
+    // Check for new blocks and show notification
+    if (lastBlockCount > 0 && d.stats.blocks > lastBlockCount && d.recent_blocks.length > 0) {
+      var latestBlock = d.recent_blocks[0];
+      showBlockNotification(latestBlock.height, latestBlock.worker);
+    }
+    lastBlockCount = d.stats.blocks;
     document.getElementById('statUptime').textContent = d.server.uptime;
     document.getElementById('payoutAddr').textContent = d.server.payout_address;
     document.getElementById('statNetDiff').textContent = d.stats.net_difficulty ? formatSI(d.stats.net_difficulty) : '---';
@@ -1516,7 +1587,29 @@ async function refresh() {
   }
 }
 
-refresh();
+var lastBlockCount = 0;
+
+function showBlockNotification(height, worker) {
+  var existing = document.querySelector('.block-notification');
+  if (existing) existing.remove();
+
+  var notification = document.createElement('div');
+  notification.className = 'block-notification';
+  notification.innerHTML =
+    '<div class="vault-icon">⚛</div>' +
+    '<h2>BLOCK FOUND!</h2>' +
+    '<div class="block-height">#' + height + '</div>' +
+    '<div class="worker-name">Discovered by: ' + worker + '</div>';
+  document.body.appendChild(notification);
+
+  setTimeout(function() {
+    if (notification.parentNode) notification.remove();
+  }, 3500);
+}
+
+refresh().then(function() {
+  // Initialize lastBlockCount after first fetch
+});
 setInterval(refresh, 2000);
 </script>
 </body>
