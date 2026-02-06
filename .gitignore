@@ -1,0 +1,21 @@
+# Vault-Tec Data Protection Protocol
+# These files contain sensitive operational data
+
+# Node binaries (user-provided)
+bin/
+
+# Runtime data
+data/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
