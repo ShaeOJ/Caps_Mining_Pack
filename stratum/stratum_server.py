@@ -1849,7 +1849,7 @@ class StratumServer:
     # -------------------------------------------------------------------
     # Web Dashboard
     # -------------------------------------------------------------------
-    def _get_dashboard_data(self) -> dict:
+    async def _get_dashboard_data(self) -> dict:
         """Collect live stats for the dashboard API."""
         now = time.time()
         uptime = int(now - self.stats["start_time"])
@@ -1880,11 +1880,11 @@ class StratumServer:
         # Current hashrate from latest sample
         current_hashrate = self.hashrate_history[-1][1] if self.hashrate_history else 0
 
-        # Network stats from node
+        # Network stats from node (async to avoid blocking the event loop)
         net_difficulty = 0
         net_hashrate = 0
         try:
-            mining_info = self.rpc.call("getmininginfo")
+            mining_info = await self.rpc.acall("getmininginfo")
             if mining_info:
                 net_difficulty = mining_info.get("difficulty", 0)
                 net_hashrate = mining_info.get("networkhashps", 0)
@@ -1893,7 +1893,7 @@ class StratumServer:
         # Fallback: some nodes omit networkhashps from getmininginfo
         if not net_hashrate:
             try:
-                net_hashrate = self.rpc.call("getnetworkhashps") or 0
+                net_hashrate = await self.rpc.acall("getnetworkhashps") or 0
             except Exception:
                 pass
 
@@ -1953,7 +1953,7 @@ class StratumServer:
             path = parts[1] if len(parts) > 1 else "/"
 
             if method == "GET" and path == "/api/stats":
-                body = json.dumps(self._get_dashboard_data()).encode("utf-8")
+                body = json.dumps(await self._get_dashboard_data()).encode("utf-8")
                 header = (
                     "HTTP/1.1 200 OK\r\n"
                     "Content-Type: application/json\r\n"
