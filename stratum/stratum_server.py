@@ -1098,7 +1098,7 @@ body::before {
 /* Stats bar */
 .stats-bar {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 15px;
   margin-bottom: 25px;
 }
@@ -1363,9 +1363,53 @@ tbody tr:hover {
   to { text-shadow: 0 0 30px rgba(20, 254, 23, 0.9), 0 0 50px rgba(20, 254, 23, 0.5); }
 }
 
+/* Stat value flash on change */
+.stat-flash {
+  animation: valFlash 0.6s ease;
+}
+@keyframes valFlash {
+  0% { text-shadow: 0 0 15px rgba(20,254,23,0.8); }
+  100% { text-shadow: var(--pip-glow); }
+}
+
+/* Smooth table row transitions */
+tbody tr {
+  transition: background 0.3s ease;
+}
+
+/* VR badge */
+.vr-badge {
+  display: inline-block;
+  font-size: 9px;
+  font-family: 'Orbitron', sans-serif;
+  background: rgba(20,254,23,0.15);
+  border: 1px solid var(--pip-green-dim);
+  color: var(--pip-green);
+  padding: 1px 4px;
+  margin-left: 6px;
+  vertical-align: middle;
+  letter-spacing: 1px;
+}
+
+/* Graph tooltip */
+.graph-tooltip {
+  position: absolute;
+  background: rgba(11,12,10,0.92);
+  border: 1px solid var(--pip-green);
+  color: var(--pip-green);
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 12px;
+  padding: 4px 8px;
+  pointer-events: none;
+  white-space: nowrap;
+  z-index: 10;
+  box-shadow: 0 0 8px rgba(20,254,23,0.3);
+  display: none;
+}
+
 /* Responsive */
 @media (max-width: 700px) {
-  .stats-bar { grid-template-columns: repeat(2, 1fr); }
+  .stats-bar { grid-template-columns: repeat(2, 1fr); gap: 10px; }
   .header h1 { font-size: 18px; letter-spacing: 2px; }
   table { font-size: 11px; }
   thead th, tbody td { padding: 6px 6px; }
@@ -1389,6 +1433,10 @@ tbody tr:hover {
     <div class="stat-card">
       <div class="stat-label">Shares Accepted</div>
       <div class="stat-value" id="statAccepted">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Shares Rejected</div>
+      <div class="stat-value" id="statRejected" style="color: var(--pip-green)">0</div>
     </div>
     <div class="stat-card">
       <div class="stat-label">Blocks Found</div>
@@ -1432,6 +1480,7 @@ tbody tr:hover {
     <div class="graph-container">
       <canvas id="hashrateGraph"></canvas>
       <div class="graph-label" id="currentHashrate">0 H/s</div>
+      <div class="graph-tooltip" id="graphTooltip"></div>
     </div>
   </div>
 
@@ -1445,13 +1494,14 @@ tbody tr:hover {
           <th>User Agent</th>
           <th>IP</th>
           <th>Difficulty</th>
-          <th>Shares</th>
+          <th>Accepted</th>
+          <th>Rejected</th>
           <th>Connected</th>
           <th>Last Share</th>
         </tr>
       </thead>
       <tbody id="minersTable">
-        <tr><td colspan="8" class="no-data">No miners connected</td></tr>
+        <tr><td colspan="9" class="no-data">No miners connected</td></tr>
       </tbody>
     </table>
   </div>
@@ -1481,7 +1531,7 @@ tbody tr:hover {
 
 <script>
 function formatTime(ts) {
-  const d = new Date(ts * 1000);
+  var d = new Date(ts * 1000);
   return d.toLocaleString();
 }
 
@@ -1506,6 +1556,85 @@ function formatHashrate(hr) {
   return v.toFixed(2) + ' ' + units[idx];
 }
 
+function formatDiff(d) {
+  if (d === 0) return '0';
+  if (d >= 1) return d.toPrecision(4);
+  // For small diffs, show enough digits
+  return d.toPrecision(4);
+}
+
+/* ---- Stat flash helper ---- */
+function updateStat(id, val) {
+  var el = document.getElementById(id);
+  if (!el) return;
+  var s = String(val);
+  if (el.textContent !== s) {
+    el.textContent = s;
+    el.classList.remove('stat-flash');
+    void el.offsetWidth;
+    el.classList.add('stat-flash');
+  }
+}
+
+/* ---- Miner table builder ---- */
+function buildMinerRow(m) {
+  var vrBadge = m.version_rolling ? '<span class="vr-badge">VR</span>' : '';
+  var rejStyle = m.rejected > 0 ? ' style="color: var(--pip-red)"' : '';
+  return '<tr>' +
+    '<td><span class="status-dot"></span></td>' +
+    '<td>' + m.worker + vrBadge + '</td>' +
+    '<td>' + m.user_agent + '</td>' +
+    '<td>' + m.ip + '</td>' +
+    '<td>' + formatDiff(m.difficulty) + '</td>' +
+    '<td>' + m.shares + '</td>' +
+    '<td' + rejStyle + '>' + m.rejected + '</td>' +
+    '<td>' + m.connected + '</td>' +
+    '<td>' + m.last_share + '</td>' +
+    '</tr>';
+}
+
+function buildMinersHTML(miners) {
+  return miners.map(buildMinerRow).join('');
+}
+
+function buildBlocksHTML(blocks) {
+  return blocks.map(function(b) {
+    return '<tr>' +
+      '<td>' + b.height + '</td>' +
+      '<td class="hash-cell" title="' + b.hash + '">' + truncHash(b.hash) + '</td>' +
+      '<td>' + b.worker + '</td>' +
+      '<td>' + formatTime(b.time) + '</td>' +
+      '</tr>';
+  }).join('');
+}
+
+/* ---- Catmull-Rom smooth curve ---- */
+function smoothLine(ctx, points) {
+  if (points.length < 2) return;
+  ctx.moveTo(points[0].x, points[0].y);
+  if (points.length === 2) {
+    ctx.lineTo(points[1].x, points[1].y);
+    return;
+  }
+  for (var i = 0; i < points.length - 1; i++) {
+    var p0 = points[i === 0 ? 0 : i - 1];
+    var p1 = points[i];
+    var p2 = points[i + 1];
+    var p3 = points[i + 2 >= points.length ? points.length - 1 : i + 2];
+    var cp1x = p1.x + (p2.x - p0.x) / 6;
+    var cp1y = p1.y + (p2.y - p0.y) / 6;
+    var cp2x = p2.x - (p3.x - p1.x) / 6;
+    var cp2y = p2.y - (p3.y - p1.y) / 6;
+    ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, p2.x, p2.y);
+  }
+}
+
+/* ---- Graph state ---- */
+var graphPoints = [];   // cached {x, y, hr, t} for hover lookup
+var graphHoverIdx = -1;
+var graphPadL = 80, graphPadR = 15, graphPadT = 10, graphPadB = 25;
+var graphPulsePhase = 0;
+
 function drawHashrateGraph(history) {
   var canvas = document.getElementById('hashrateGraph');
   if (!canvas) return;
@@ -1518,10 +1647,9 @@ function drawHashrateGraph(history) {
   var ctx = canvas.getContext('2d');
   ctx.scale(dpr, dpr);
 
-  // Clear
   ctx.clearRect(0, 0, w, h);
 
-  var padL = 80, padR = 15, padT = 10, padB = 25;
+  var padL = graphPadL, padR = graphPadR, padT = graphPadT, padB = graphPadB;
   var gw = w - padL - padR;
   var gh = h - padT - padB;
 
@@ -1530,10 +1658,10 @@ function drawHashrateGraph(history) {
     ctx.font = '12px "Share Tech Mono", monospace';
     ctx.textAlign = 'center';
     ctx.fillText('Waiting for data...', w / 2, h / 2);
+    graphPoints = [];
     return;
   }
 
-  // Only show last 30 min of data to avoid ramp-up compression
   var cutoff = history[history.length - 1].t - 1800;
   history = history.filter(function(p) { return p.t >= cutoff; });
   if (history.length < 2) {
@@ -1541,6 +1669,7 @@ function drawHashrateGraph(history) {
     ctx.font = '12px "Share Tech Mono", monospace';
     ctx.textAlign = 'center';
     ctx.fillText('Waiting for data...', w / 2, h / 2);
+    graphPoints = [];
     return;
   }
 
@@ -1550,10 +1679,8 @@ function drawHashrateGraph(history) {
   var minHr = Math.min.apply(null, hrs);
   if (maxHr <= 0) maxHr = 1;
 
-  // Use a floor-to-ceiling range so axis labels match the visible line
-  // Add 15% headroom above max and floor at 0 if min is close to 0
   var axisMin = 0;
-  if (minHr > maxHr * 0.5) axisMin = minHr * 0.85;  // zoom in if line is stable
+  if (minHr > maxHr * 0.5) axisMin = minHr * 0.85;
   var axisMax = maxHr * 1.15;
 
   var tMin = times[0];
@@ -1610,14 +1737,28 @@ function drawHashrateGraph(history) {
   for (var i = 0; i < history.length; i++) {
     var x = padL + ((times[i] - tMin) / tRange) * gw;
     var y = padT + gh - ((hrs[i] - axisMin) / axisRange) * gh;
-    points.push({ x: x, y: y });
+    points.push({ x: x, y: y, hr: hrs[i], t: times[i] });
   }
+  graphPoints = points;
 
-  // Filled area
+  // Filled area (smooth)
   ctx.beginPath();
   ctx.moveTo(points[0].x, padT + gh);
-  for (var i = 0; i < points.length; i++) {
-    ctx.lineTo(points[i].x, points[i].y);
+  ctx.lineTo(points[0].x, points[0].y);
+  if (points.length > 2) {
+    for (var i = 0; i < points.length - 1; i++) {
+      var p0 = points[i === 0 ? 0 : i - 1];
+      var p1 = points[i];
+      var p2 = points[i + 1];
+      var p3 = points[i + 2 >= points.length ? points.length - 1 : i + 2];
+      var cp1x = p1.x + (p2.x - p0.x) / 6;
+      var cp1y = p1.y + (p2.y - p0.y) / 6;
+      var cp2x = p2.x - (p3.x - p1.x) / 6;
+      var cp2y = p2.y - (p3.y - p1.y) / 6;
+      ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, p2.x, p2.y);
+    }
+  } else {
+    ctx.lineTo(points[1].x, points[1].y);
   }
   ctx.lineTo(points[points.length - 1].x, padT + gh);
   ctx.closePath();
@@ -1627,41 +1768,131 @@ function drawHashrateGraph(history) {
   ctx.fillStyle = grad;
   ctx.fill();
 
-  // Line with glow
+  // Line with glow (smooth)
   ctx.shadowColor = 'rgba(20,254,23,0.6)';
   ctx.shadowBlur = 6;
   ctx.strokeStyle = '#14fe17';
   ctx.lineWidth = 2;
   ctx.beginPath();
-  for (var i = 0; i < points.length; i++) {
-    if (i === 0) ctx.moveTo(points[i].x, points[i].y);
-    else ctx.lineTo(points[i].x, points[i].y);
-  }
+  smoothLine(ctx, points);
   ctx.stroke();
   ctx.shadowBlur = 0;
+
+  // Glowing dot at latest point
+  var last = points[points.length - 1];
+  graphPulsePhase = (graphPulsePhase + 0.15) % (2 * Math.PI);
+  var pulseR = 4 + Math.sin(graphPulsePhase) * 2;
+  ctx.beginPath();
+  ctx.arc(last.x, last.y, pulseR, 0, 2 * Math.PI);
+  ctx.fillStyle = '#14fe17';
+  ctx.shadowColor = 'rgba(20,254,23,0.8)';
+  ctx.shadowBlur = 10;
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  // Hover crosshair + highlight
+  if (graphHoverIdx >= 0 && graphHoverIdx < points.length) {
+    var hp = points[graphHoverIdx];
+    // Vertical crosshair
+    ctx.strokeStyle = 'rgba(20,254,23,0.4)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(hp.x, padT);
+    ctx.lineTo(hp.x, padT + gh);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Highlight dot
+    ctx.beginPath();
+    ctx.arc(hp.x, hp.y, 5, 0, 2 * Math.PI);
+    ctx.fillStyle = '#14fe17';
+    ctx.shadowColor = 'rgba(20,254,23,0.9)';
+    ctx.shadowBlur = 12;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
 }
+
+/* ---- Graph hover ---- */
+(function() {
+  var canvas = document.getElementById('hashrateGraph');
+  var tooltip = document.getElementById('graphTooltip');
+  if (!canvas || !tooltip) return;
+
+  canvas.addEventListener('mousemove', function(e) {
+    var rect = canvas.getBoundingClientRect();
+    var mx = e.clientX - rect.left;
+    if (graphPoints.length < 2) { graphHoverIdx = -1; tooltip.style.display = 'none'; return; }
+
+    // Find nearest point by x
+    var best = -1, bestDist = Infinity;
+    for (var i = 0; i < graphPoints.length; i++) {
+      var dx = Math.abs(graphPoints[i].x - mx);
+      if (dx < bestDist) { bestDist = dx; best = i; }
+    }
+    if (bestDist > 30) { graphHoverIdx = -1; tooltip.style.display = 'none'; return; }
+    graphHoverIdx = best;
+
+    var p = graphPoints[best];
+    var ago = Math.round(graphPoints[graphPoints.length - 1].t - p.t);
+    var label = ago === 0 ? 'now' : ago + 's ago';
+    tooltip.textContent = formatHashrate(p.hr) + '  (' + label + ')';
+    tooltip.style.display = 'block';
+
+    // Position tooltip near the point
+    var tx = p.x + 12;
+    var ty = p.y - 20;
+    // Keep tooltip on screen
+    var tw = tooltip.offsetWidth;
+    var container = canvas.parentElement;
+    if (tx + tw > container.clientWidth - 5) tx = p.x - tw - 12;
+    if (ty < 5) ty = 5;
+    tooltip.style.left = tx + 'px';
+    tooltip.style.top = ty + 'px';
+  });
+
+  canvas.addEventListener('mouseleave', function() {
+    graphHoverIdx = -1;
+    tooltip.style.display = 'none';
+  });
+})();
+
+/* ---- Targeted DOM update state ---- */
+var prevMinerKeys = '';
+var prevBlockCount = 0;
+var lastBlockCount = 0;
 
 async function refresh() {
   try {
-    const r = await fetch('/api/stats');
-    const d = await r.json();
+    var r = await fetch('/api/stats');
+    var d = await r.json();
 
+    // Header info (no flash needed)
     document.getElementById('blockHeight').textContent = d.server.block_height;
     document.getElementById('stratumPort').textContent = d.server.stratum_port;
-    document.getElementById('statMiners').textContent = d.stats.miners;
-    document.getElementById('statAccepted').textContent = d.stats.accepted.toLocaleString();
-    document.getElementById('statBlocks').textContent = d.stats.blocks;
 
-    // Check for new blocks and show notification
+    // Stat cards with flash
+    updateStat('statMiners', d.stats.miners);
+    updateStat('statAccepted', d.stats.accepted.toLocaleString());
+    updateStat('statRejected', d.stats.rejected);
+    updateStat('statBlocks', d.stats.blocks);
+    updateStat('statUptime', d.server.uptime);
+    updateStat('statNetDiff', d.stats.net_difficulty ? formatSI(d.stats.net_difficulty) : '---');
+    updateStat('statNetHash', d.stats.net_hashrate ? formatHashrate(d.stats.net_hashrate) : '---');
+
+    // Color rejected stat red if > 0
+    var rejEl = document.getElementById('statRejected');
+    if (rejEl) rejEl.style.color = d.stats.rejected > 0 ? 'var(--pip-red)' : 'var(--pip-green)';
+
+    // Block notification
     if (lastBlockCount > 0 && d.stats.blocks > lastBlockCount && d.recent_blocks.length > 0) {
       var latestBlock = d.recent_blocks[0];
       showBlockNotification(latestBlock.height, latestBlock.worker);
     }
     lastBlockCount = d.stats.blocks;
-    document.getElementById('statUptime').textContent = d.server.uptime;
+
     document.getElementById('payoutAddr').textContent = d.server.payout_address;
-    document.getElementById('statNetDiff').textContent = d.stats.net_difficulty ? formatSI(d.stats.net_difficulty) : '---';
-    document.getElementById('statNetHash').textContent = d.stats.net_hashrate ? formatHashrate(d.stats.net_hashrate) : '---';
     if (d.server.stratum_url) {
       document.getElementById('stratumUrl').textContent = d.server.stratum_url;
       document.getElementById('stratumUrl').title = d.server.stratum_url;
@@ -1671,45 +1902,59 @@ async function refresh() {
     drawHashrateGraph(d.hashrate_history);
     document.getElementById('currentHashrate').textContent = formatHashrate(d.stats.current_hashrate || 0);
 
-    // Miners table
-    const mt = document.getElementById('minersTable');
+    // ---- Miners table: targeted update ----
+    var mt = document.getElementById('minersTable');
     if (d.miners.length === 0) {
-      mt.innerHTML = '<tr><td colspan="8" class="no-data">No miners connected</td></tr>';
+      if (prevMinerKeys !== '') {
+        mt.innerHTML = '<tr><td colspan="9" class="no-data">No miners connected</td></tr>';
+        prevMinerKeys = '';
+      }
     } else {
-      mt.innerHTML = d.miners.map(m =>
-        '<tr>' +
-        '<td><span class="status-dot"></span></td>' +
-        '<td>' + m.worker + '</td>' +
-        '<td>' + m.user_agent + '</td>' +
-        '<td>' + m.ip + '</td>' +
-        '<td>' + m.difficulty + '</td>' +
-        '<td>' + m.shares + '</td>' +
-        '<td>' + m.connected + '</td>' +
-        '<td>' + m.last_share + '</td>' +
-        '</tr>'
-      ).join('');
+      var newKeys = d.miners.map(function(m) { return m.worker + '|' + m.ip; }).join('||');
+      if (newKeys !== prevMinerKeys) {
+        // Full rebuild: miners joined/left
+        prevMinerKeys = newKeys;
+        mt.innerHTML = buildMinersHTML(d.miners);
+      } else {
+        // In-place update of changing cells only
+        var rows = mt.querySelectorAll('tr');
+        d.miners.forEach(function(m, i) {
+          if (!rows[i]) return;
+          var cells = rows[i].querySelectorAll('td');
+          if (cells.length < 9) return;
+          // cells: 0=dot, 1=worker+VR, 2=agent, 3=ip, 4=diff, 5=accepted, 6=rejected, 7=connected, 8=last_share
+          var newDiff = formatDiff(m.difficulty);
+          if (cells[4].textContent !== newDiff) cells[4].textContent = newDiff;
+          var newShares = String(m.shares);
+          if (cells[5].textContent !== newShares) cells[5].textContent = newShares;
+          var newRej = String(m.rejected);
+          if (cells[6].textContent !== newRej) {
+            cells[6].textContent = newRej;
+            cells[6].style.color = m.rejected > 0 ? 'var(--pip-red)' : '';
+          }
+          var newConn = m.connected;
+          if (cells[7].textContent !== newConn) cells[7].textContent = newConn;
+          var newLs = m.last_share;
+          if (cells[8].textContent !== newLs) cells[8].textContent = newLs;
+        });
+      }
     }
 
-    // Blocks table
-    const bt = document.getElementById('blocksTable');
+    // ---- Blocks table: only rebuild on change ----
+    var bt = document.getElementById('blocksTable');
     if (d.recent_blocks.length === 0) {
-      bt.innerHTML = '<tr><td colspan="4" class="no-data">No blocks found yet</td></tr>';
-    } else {
-      bt.innerHTML = d.recent_blocks.map(b =>
-        '<tr>' +
-        '<td>' + b.height + '</td>' +
-        '<td class="hash-cell" title="' + b.hash + '">' + truncHash(b.hash) + '</td>' +
-        '<td>' + b.worker + '</td>' +
-        '<td>' + formatTime(b.time) + '</td>' +
-        '</tr>'
-      ).join('');
+      if (prevBlockCount !== 0) {
+        bt.innerHTML = '<tr><td colspan="4" class="no-data">No blocks found yet</td></tr>';
+        prevBlockCount = 0;
+      }
+    } else if (d.recent_blocks.length !== prevBlockCount) {
+      prevBlockCount = d.recent_blocks.length;
+      bt.innerHTML = buildBlocksHTML(d.recent_blocks);
     }
   } catch (e) {
     console.error('Dashboard refresh failed:', e);
   }
 }
-
-var lastBlockCount = 0;
 
 function showBlockNotification(height, worker) {
   var existing = document.querySelector('.block-notification');
