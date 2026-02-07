@@ -6,6 +6,7 @@ Supports Nerdminer, cgminer, and other Stratum v1 compatible miners.
 """
 
 import asyncio
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -231,6 +232,8 @@ class RPCClient:
             + binascii.b2a_base64(f"{user}:{password}".encode()).decode().strip()
         )
         self._id = 0
+        # Dedicated thread pool so RPC calls don't starve the default executor
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="rpc")
 
     def _call_sync(self, method, params=None):
         """Synchronous RPC call (runs in thread pool to avoid blocking event loop)."""
@@ -263,10 +266,10 @@ class RPCClient:
             return None
 
     async def acall(self, method, params=None):
-        """Async wrapper — runs the blocking HTTP call in a thread so the
-        asyncio event loop stays responsive for miner I/O."""
+        """Async wrapper — runs the blocking HTTP call in a dedicated thread
+        pool so the asyncio event loop stays responsive for miner I/O."""
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._call_sync, method, params)
+        return await loop.run_in_executor(self._executor, self._call_sync, method, params)
 
     def call(self, method, params=None):
         """Blocking call for use outside the event loop (startup checks)."""
@@ -876,8 +879,14 @@ class MinerSession:
         try:
             data = json.dumps(msg) + "\n"
             self.writer.write(data.encode())
-            await self.writer.drain()
+            await asyncio.wait_for(self.writer.drain(), timeout=5)
         except (ConnectionError, OSError):
+            pass
+        except asyncio.TimeoutError:
+            # Dead connection — close it so the miner gets removed
+            log.debug("Send timeout to %s, closing connection", self.worker_name)
+            self.writer.close()
+        except Exception:
             pass
 
 
@@ -1651,6 +1660,9 @@ class StratumDB:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._create_tables()
+        # Dedicated single-thread pool (sqlite3 connections aren't thread-safe
+        # even with check_same_thread=False when writes overlap)
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="db")
 
     # -- schema -------------------------------------------------------------
 
@@ -1767,23 +1779,23 @@ class StratumDB:
 
     async def record_share(self, timestamp, worker, difficulty, job_height):
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self._record_share, timestamp, worker, difficulty, job_height)
+        await loop.run_in_executor(self._executor, self._record_share, timestamp, worker, difficulty, job_height)
 
     async def record_block(self, height, block_hash, worker, timestamp, accepted=1):
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self._record_block, height, block_hash, worker, timestamp, accepted)
+        await loop.run_in_executor(self._executor, self._record_block, height, block_hash, worker, timestamp, accepted)
 
     async def record_hashrate_sample(self, timestamp, hashrate):
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self._record_hashrate_sample, timestamp, hashrate)
+        await loop.run_in_executor(self._executor, self._record_hashrate_sample, timestamp, hashrate)
 
     async def save_pool_stats(self, accepted, rejected, blocks):
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self._save_pool_stats, accepted, rejected, blocks)
+        await loop.run_in_executor(self._executor, self._save_pool_stats, accepted, rejected, blocks)
 
     async def cleanup_old_data(self):
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self._cleanup_old_data)
+        await loop.run_in_executor(self._executor, self._cleanup_old_data)
 
 
 # ---------------------------------------------------------------------------
@@ -1910,13 +1922,33 @@ class StratumServer:
         return True
 
     async def _notify_miners(self, job: Job, clean_jobs: bool = True):
-        """Push a mining.notify to every connected miner."""
+        """Push a mining.notify to every connected miner (concurrently)."""
         params = job.get_notify_params(clean_jobs=clean_jobs)
-        for miner in list(self.miners):
+        miners_snapshot = list(self.miners)
+        if not miners_snapshot:
+            self.last_notify_time = time.time()
+            return
+
+        async def _notify_one(miner):
             try:
-                await miner.send_method("mining.notify", params)
+                await asyncio.wait_for(
+                    miner.send_method("mining.notify", params), timeout=5
+                )
+                return True
             except Exception:
-                pass
+                return False
+
+        results = await asyncio.gather(
+            *[_notify_one(m) for m in miners_snapshot],
+            return_exceptions=True,
+        )
+        for miner, ok in zip(miners_snapshot, results):
+            if ok is not True:
+                self.remove_miner(miner)
+                try:
+                    miner.writer.close()
+                except Exception:
+                    pass
         self.last_notify_time = time.time()
 
     async def _hashrate_sampler(self):
@@ -2031,34 +2063,61 @@ class StratumServer:
         log.info("Stratum server listening on port %d", self.listen_port)
         log.info("Miners can connect to: stratum+tcp://<your-ip>:%d", self.listen_port)
 
-        # Start dashboard HTTP server
+        # Start dashboard HTTP server on a separate thread so it never
+        # competes with the asyncio event loop.
         try:
-            dashboard_server = await asyncio.start_server(
-                self._handle_http, "0.0.0.0", self.dashboard_port
-            )
+            self._start_dashboard_thread()
             log.info("Dashboard available at: http://localhost:%d", self.dashboard_port)
         except OSError as e:
             log.warning("Could not start dashboard on port %d: %s", self.dashboard_port, e)
-            dashboard_server = None
 
         log.info("=" * 60)
 
         # Stats printer
         asyncio.ensure_future(self.stats_loop())
 
-        if dashboard_server:
-            async with server, dashboard_server:
-                await asyncio.gather(
-                    server.serve_forever(),
-                    dashboard_server.serve_forever(),
-                )
-        else:
-            async with server:
-                await server.serve_forever()
+        async with server:
+            await server.serve_forever()
 
     # -------------------------------------------------------------------
-    # Web Dashboard
+    # Web Dashboard (threaded HTTP server — fully isolated from event loop)
     # -------------------------------------------------------------------
+    def _start_dashboard_thread(self):
+        """Start a stdlib HTTP server on a daemon thread."""
+        import http.server
+        import threading
+
+        stratum_server = self  # capture for the handler closure
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/api/stats":
+                    body = json.dumps(stratum_server._get_dashboard_data()).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path == "/":
+                    body = DASHBOARD_HTML.encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_error(404)
+
+            def log_message(self, format, *args):
+                pass  # suppress per-request logging
+
+        srv = http.server.ThreadingHTTPServer(("0.0.0.0", self.dashboard_port), Handler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+
     def _get_dashboard_data(self) -> dict:
         """Collect live stats for the dashboard API.
 
@@ -2141,63 +2200,6 @@ class StratumServer:
                 log.info("DB cleanup: removed old shares and hashrate samples")
             except Exception as e:
                 log.warning("DB cleanup error: %s", e)
-
-    async def _handle_http(self, reader, writer):
-        """Minimal async HTTP handler for the dashboard."""
-        try:
-            request_line = await asyncio.wait_for(reader.readline(), timeout=5)
-            if not request_line:
-                return
-
-            # Read remaining headers (discard)
-            while True:
-                line = await asyncio.wait_for(reader.readline(), timeout=5)
-                if line in (b"\r\n", b"\n", b""):
-                    break
-
-            request_str = request_line.decode("utf-8", errors="replace").strip()
-            parts = request_str.split(" ")
-            method = parts[0] if parts else "GET"
-            path = parts[1] if len(parts) > 1 else "/"
-
-            if method == "GET" and path == "/api/stats":
-                body = json.dumps(self._get_dashboard_data()).encode("utf-8")
-                header = (
-                    "HTTP/1.1 200 OK\r\n"
-                    "Content-Type: application/json\r\n"
-                    "Access-Control-Allow-Origin: *\r\n"
-                    f"Content-Length: {len(body)}\r\n"
-                    "Connection: close\r\n\r\n"
-                )
-                writer.write(header.encode() + body)
-            elif method == "GET" and path == "/":
-                body = DASHBOARD_HTML.encode("utf-8")
-                header = (
-                    "HTTP/1.1 200 OK\r\n"
-                    "Content-Type: text/html; charset=utf-8\r\n"
-                    f"Content-Length: {len(body)}\r\n"
-                    "Connection: close\r\n\r\n"
-                )
-                writer.write(header.encode() + body)
-            else:
-                body = b"404 Not Found"
-                header = (
-                    "HTTP/1.1 404 Not Found\r\n"
-                    "Content-Type: text/plain\r\n"
-                    f"Content-Length: {len(body)}\r\n"
-                    "Connection: close\r\n\r\n"
-                )
-                writer.write(header.encode() + body)
-
-            await writer.drain()
-        except Exception:
-            pass
-        finally:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
 
     async def stats_loop(self):
         """Print stats every 60 seconds."""
