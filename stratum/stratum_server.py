@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import struct
 import sys
 import time
@@ -794,6 +795,11 @@ class MinerSession:
         self.server.share_log.append((time.time(), self.difficulty))
         await self.send_result(msg_id, True)
 
+        # Persist share to DB (fire-and-forget)
+        asyncio.ensure_future(self.server.db.record_share(
+            time.time(), self.worker_name, self.difficulty, job.height
+        ))
+
         # Build header using correct byte ordering:
         # - ntime: BE hex → LE bytes (reversed)
         # - nonce: reversed (miners send in display order, header needs LE)
@@ -831,14 +837,25 @@ class MinerSession:
                 if result is None or result == "":
                     log.info("Block submitted successfully! height=%d", job.height)
                     self.server.stats["blocks"] += 1
+                    block_time = time.time()
+                    block_hash_hex = header_hash[::-1].hex()
                     self.server.recent_blocks.append({
                         "height": job.height,
-                        "hash": header_hash[::-1].hex(),
-                        "time": time.time(),
+                        "hash": block_hash_hex,
+                        "time": block_time,
                         "worker": self.worker_name,
                     })
                     if len(self.server.recent_blocks) > 20:
                         self.server.recent_blocks = self.server.recent_blocks[-20:]
+                    # Persist block and updated stats to DB
+                    asyncio.ensure_future(self.server.db.record_block(
+                        job.height, block_hash_hex, self.worker_name, block_time
+                    ))
+                    asyncio.ensure_future(self.server.db.save_pool_stats(
+                        self.server.stats["accepted"],
+                        self.server.stats["rejected"],
+                        self.server.stats["blocks"],
+                    ))
                 else:
                     log.error("Block rejected by node: %s", result)
 
@@ -1618,6 +1635,158 @@ setInterval(refresh, 2000);
 
 
 # ---------------------------------------------------------------------------
+# SQLite persistence
+# ---------------------------------------------------------------------------
+class StratumDB:
+    """Thin async wrapper around sqlite3 for persisting pool data.
+
+    All queries run via ``run_in_executor`` so the asyncio event loop is
+    never blocked.  WAL journal mode allows concurrent readers/writer.
+    """
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._create_tables()
+
+    # -- schema -------------------------------------------------------------
+
+    def _create_tables(self):
+        c = self._conn
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS shares (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp   REAL    NOT NULL,
+                worker      TEXT    NOT NULL,
+                difficulty  REAL    NOT NULL,
+                job_height  INTEGER NOT NULL
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS blocks_found (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                height    INTEGER NOT NULL,
+                hash      TEXT    NOT NULL,
+                worker    TEXT    NOT NULL,
+                timestamp REAL    NOT NULL,
+                accepted  INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS hashrate_samples (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL    NOT NULL,
+                hashrate  REAL    NOT NULL
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS pool_stats (
+                id              INTEGER PRIMARY KEY CHECK (id = 1),
+                total_accepted  INTEGER NOT NULL DEFAULT 0,
+                total_rejected  INTEGER NOT NULL DEFAULT 0,
+                total_blocks    INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        # Ensure the single stats row exists
+        c.execute("INSERT OR IGNORE INTO pool_stats (id, total_accepted, total_rejected, total_blocks) VALUES (1,0,0,0)")
+        c.commit()
+
+    # -- write helpers (called via run_in_executor) -------------------------
+
+    def _record_share(self, timestamp, worker, difficulty, job_height):
+        self._conn.execute(
+            "INSERT INTO shares (timestamp, worker, difficulty, job_height) VALUES (?,?,?,?)",
+            (timestamp, worker, difficulty, job_height),
+        )
+        self._conn.execute(
+            "UPDATE pool_stats SET total_accepted = total_accepted + 1 WHERE id = 1"
+        )
+        self._conn.commit()
+
+    def _record_block(self, height, block_hash, worker, timestamp, accepted=1):
+        self._conn.execute(
+            "INSERT INTO blocks_found (height, hash, worker, timestamp, accepted) VALUES (?,?,?,?,?)",
+            (height, block_hash, worker, timestamp, accepted),
+        )
+        self._conn.execute(
+            "UPDATE pool_stats SET total_blocks = total_blocks + 1 WHERE id = 1"
+        )
+        self._conn.commit()
+
+    def _record_hashrate_sample(self, timestamp, hashrate):
+        self._conn.execute(
+            "INSERT INTO hashrate_samples (timestamp, hashrate) VALUES (?,?)",
+            (timestamp, hashrate),
+        )
+        self._conn.commit()
+
+    def _save_pool_stats(self, accepted, rejected, blocks):
+        self._conn.execute(
+            "UPDATE pool_stats SET total_accepted=?, total_rejected=?, total_blocks=? WHERE id=1",
+            (accepted, rejected, blocks),
+        )
+        self._conn.commit()
+
+    def _cleanup_old_data(self, share_days=7, hashrate_days=2):
+        now = time.time()
+        self._conn.execute("DELETE FROM shares WHERE timestamp < ?", (now - share_days * 86400,))
+        self._conn.execute("DELETE FROM hashrate_samples WHERE timestamp < ?", (now - hashrate_days * 86400,))
+        self._conn.commit()
+
+    # -- read helpers -------------------------------------------------------
+
+    def load_pool_stats(self):
+        row = self._conn.execute(
+            "SELECT total_accepted, total_rejected, total_blocks FROM pool_stats WHERE id=1"
+        ).fetchone()
+        if row:
+            return {"accepted": row[0], "rejected": row[1], "blocks": row[2]}
+        return {"accepted": 0, "rejected": 0, "blocks": 0}
+
+    def load_recent_blocks(self, limit=20):
+        rows = self._conn.execute(
+            "SELECT height, hash, worker, timestamp FROM blocks_found ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [
+            {"height": r[0], "hash": r[1], "worker": r[2], "time": r[3]}
+            for r in reversed(rows)
+        ]
+
+    def load_hashrate_history(self, limit=200):
+        rows = self._conn.execute(
+            "SELECT timestamp, hashrate FROM hashrate_samples ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [(r[0], r[1]) for r in reversed(rows)]
+
+    # -- async wrappers -----------------------------------------------------
+
+    async def record_share(self, timestamp, worker, difficulty, job_height):
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._record_share, timestamp, worker, difficulty, job_height)
+
+    async def record_block(self, height, block_hash, worker, timestamp, accepted=1):
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._record_block, height, block_hash, worker, timestamp, accepted)
+
+    async def record_hashrate_sample(self, timestamp, hashrate):
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._record_hashrate_sample, timestamp, hashrate)
+
+    async def save_pool_stats(self, accepted, rejected, blocks):
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._save_pool_stats, accepted, rejected, blocks)
+
+    async def cleanup_old_data(self):
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._cleanup_old_data)
+
+
+# ---------------------------------------------------------------------------
 # Stratum Server
 # ---------------------------------------------------------------------------
 class StratumServer:
@@ -1652,6 +1821,29 @@ class StratumServer:
         # Hashrate tracking
         self.share_log = []          # [(timestamp, difficulty), ...] per accepted share
         self.hashrate_history = []   # [(timestamp, hashrate), ...] periodic snapshots
+
+        # Cached network stats (updated by background task, never in HTTP handler)
+        self._cached_net_difficulty = 0
+        self._cached_net_hashrate = 0
+        self._cached_local_ip = self._detect_local_ip()
+
+        # SQLite persistence
+        db_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+        self.db = StratumDB(os.path.join(db_dir, "stratum.db"))
+
+    # -------------------------------------------------------------------
+    @staticmethod
+    def _detect_local_ip() -> str:
+        """Detect local LAN IP once (no repeated socket calls)."""
+        try:
+            import socket as _sock
+            s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "127.0.0.1"
 
     def find_job(self, job_id):
         return self.jobs.get(job_id)
@@ -1742,6 +1934,8 @@ class StratumServer:
             # Keep last 200 hashrate entries (~33 min)
             if len(self.hashrate_history) > 200:
                 self.hashrate_history = self.hashrate_history[-200:]
+            # Persist sample to DB (fire-and-forget)
+            asyncio.ensure_future(self.db.record_hashrate_sample(now, hashrate))
 
     async def poll_loop(self):
         """Periodically poll the node for new block templates."""
@@ -1802,6 +1996,16 @@ class StratumServer:
         log.info("Connected to Caps node: chain=%s, blocks=%d",
                  info.get("chain", "?"), info.get("blocks", 0))
 
+        # Restore persisted stats from SQLite
+        saved = self.db.load_pool_stats()
+        self.stats["accepted"] = saved["accepted"]
+        self.stats["rejected"] = saved["rejected"]
+        self.stats["blocks"] = saved["blocks"]
+        self.recent_blocks = self.db.load_recent_blocks()
+        self.hashrate_history = self.db.load_hashrate_history()
+        log.info("Restored from DB: accepted=%d blocks=%d hashrate_samples=%d",
+                 saved["accepted"], saved["blocks"], len(self.hashrate_history))
+
         # Get initial job
         await self.update_job()
         if self.current_job is None:
@@ -1813,6 +2017,12 @@ class StratumServer:
 
         # Start hashrate sampler
         asyncio.ensure_future(self._hashrate_sampler())
+
+        # Start background network stats updater (avoids RPC in HTTP handler)
+        asyncio.ensure_future(self._network_stats_updater())
+
+        # Start DB cleanup loop (hourly)
+        asyncio.ensure_future(self._db_cleanup_loop())
 
         # Start stratum listener
         server = await asyncio.start_server(
@@ -1849,8 +2059,12 @@ class StratumServer:
     # -------------------------------------------------------------------
     # Web Dashboard
     # -------------------------------------------------------------------
-    async def _get_dashboard_data(self) -> dict:
-        """Collect live stats for the dashboard API."""
+    def _get_dashboard_data(self) -> dict:
+        """Collect live stats for the dashboard API.
+
+        Pure in-memory read — no I/O, no RPC, no await.  Network stats
+        are refreshed by the ``_network_stats_updater`` background task.
+        """
         now = time.time()
         uptime = int(now - self.stats["start_time"])
         hours, rem = divmod(uptime, 3600)
@@ -1874,39 +2088,8 @@ class StratumServer:
                 ),
             })
 
-        # Try to get current block height from the node (cached in current_job)
         block_height = self.current_job.height if self.current_job else 0
-
-        # Current hashrate from latest sample
         current_hashrate = self.hashrate_history[-1][1] if self.hashrate_history else 0
-
-        # Network stats from node (async to avoid blocking the event loop)
-        net_difficulty = 0
-        net_hashrate = 0
-        try:
-            mining_info = await self.rpc.acall("getmininginfo")
-            if mining_info:
-                net_difficulty = mining_info.get("difficulty", 0)
-                net_hashrate = mining_info.get("networkhashps", 0)
-        except Exception:
-            pass
-        # Fallback: some nodes omit networkhashps from getmininginfo
-        if not net_hashrate:
-            try:
-                net_hashrate = await self.rpc.acall("getnetworkhashps") or 0
-            except Exception:
-                pass
-
-        # Detect local IP for miner connection info
-        local_ip = "127.0.0.1"
-        try:
-            import socket as _sock
-            s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            local_ip = s.getsockname()[0]
-            s.close()
-        except Exception:
-            pass
 
         return {
             "server": {
@@ -1914,8 +2097,8 @@ class StratumServer:
                 "payout_address": self.payout_address,
                 "stratum_port": self.listen_port,
                 "block_height": block_height,
-                "local_ip": local_ip,
-                "stratum_url": f"stratum+tcp://{local_ip}:{self.listen_port}",
+                "local_ip": self._cached_local_ip,
+                "stratum_url": f"stratum+tcp://{self._cached_local_ip}:{self.listen_port}",
             },
             "stats": {
                 "miners": len(self.miners),
@@ -1923,8 +2106,8 @@ class StratumServer:
                 "rejected": self.stats["rejected"],
                 "blocks": self.stats["blocks"],
                 "current_hashrate": current_hashrate,
-                "net_difficulty": net_difficulty,
-                "net_hashrate": net_hashrate,
+                "net_difficulty": self._cached_net_difficulty,
+                "net_hashrate": self._cached_net_hashrate,
             },
             "miners": miners_list,
             "recent_blocks": list(reversed(self.recent_blocks)),
@@ -1932,6 +2115,32 @@ class StratumServer:
                 {"t": t, "hr": hr} for t, hr in self.hashrate_history
             ],
         }
+
+    async def _network_stats_updater(self):
+        """Fetch network difficulty/hashrate via RPC every 30s into cache."""
+        while True:
+            try:
+                mining_info = await self.rpc.acall("getmininginfo")
+                if mining_info:
+                    self._cached_net_difficulty = mining_info.get("difficulty", 0)
+                    self._cached_net_hashrate = mining_info.get("networkhashps", 0)
+                if not self._cached_net_hashrate:
+                    nh = await self.rpc.acall("getnetworkhashps")
+                    if nh:
+                        self._cached_net_hashrate = nh
+            except Exception:
+                pass
+            await asyncio.sleep(30)
+
+    async def _db_cleanup_loop(self):
+        """Hourly cleanup of old shares and hashrate samples."""
+        while True:
+            await asyncio.sleep(3600)
+            try:
+                await self.db.cleanup_old_data()
+                log.info("DB cleanup: removed old shares and hashrate samples")
+            except Exception as e:
+                log.warning("DB cleanup error: %s", e)
 
     async def _handle_http(self, reader, writer):
         """Minimal async HTTP handler for the dashboard."""
@@ -1953,7 +2162,7 @@ class StratumServer:
             path = parts[1] if len(parts) > 1 else "/"
 
             if method == "GET" and path == "/api/stats":
-                body = json.dumps(await self._get_dashboard_data()).encode("utf-8")
+                body = json.dumps(self._get_dashboard_data()).encode("utf-8")
                 header = (
                     "HTTP/1.1 200 OK\r\n"
                     "Content-Type: application/json\r\n"
