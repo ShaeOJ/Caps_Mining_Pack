@@ -3,9 +3,17 @@
   "rpc_port": 10567,
   "rpc_user": "a952c1bebef738a1fef00ea0e9995bdf",
   "rpc_password": "254d82d43aa805b613833e6459de545a6faeac66798e45c21149f249c5d4b2e7",
-  "payout_address": "caps1qnk3y2kyfv07r832h63a0ug84z3354vgqyk9lzl",
+  "payout_address": "caps1qren9dekh9mkerm8lvzm9thxdywnj57hffql4r6",
   "stratum_port": 10333,
   "dashboard_port": 8080,
   "difficulty": 0.001,
-  "poll_interval": 15
+  "poll_interval": 15,
+  "vardiff": {
+    "min_diff": 0.0001,
+    "max_diff": 65536,
+    "target_shares_per_min": 6,
+    "retarget_interval": 90,
+    "tolerance": 0.3
+  },
+  "version_rolling_mask": "1fffe000"
 }

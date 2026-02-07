@@ -575,7 +575,11 @@ class MinerSession:
         self._task = None  # set by handle_client after task creation
         self.connected_at = time.time()
         self.shares_accepted = 0
+        self.shares_rejected = 0
         self.last_share_time = None
+        self.vardiff_share_times = []      # timestamps of recent shares for rate calculation
+        self.vardiff_last_retarget = time.time()
+        self.vardiff_frozen_until = 0      # if miner used suggest_difficulty, freeze vardiff temporarily
 
     @staticmethod
     def _extract_json_objects(line: str) -> list:
@@ -671,14 +675,16 @@ class MinerSession:
 
         for ext in extensions:
             if ext == "version-rolling":
-                # Accept version rolling — the miner will modify version bits
-                # to expand nonce space. We store the mask so we can apply it
-                # when reconstructing block headers for submission.
+                # Accept version rolling — intersect miner's requested mask
+                # with the server-allowed mask (BIP 310 compliance).
                 mask = ext_params.get("version-rolling.mask", "1fffe000")
-                self.version_rolling_mask = int(mask, 16)
+                miner_mask = int(mask, 16)
+                effective_mask = miner_mask & self.server.allowed_version_mask
+                self.version_rolling_mask = effective_mask
                 result["version-rolling"] = True
-                result["version-rolling.mask"] = mask
-                log.info("Version rolling enabled for %s (mask: %s)", self.addr, mask)
+                result["version-rolling.mask"] = f"{effective_mask:08x}"
+                log.info("Version rolling enabled for %s (requested: %s, effective: %08x)",
+                         self.addr, mask, effective_mask)
             elif ext == "minimum-difficulty":
                 min_diff = ext_params.get("minimum-difficulty.value", 1)
                 result["minimum-difficulty"] = True
@@ -736,11 +742,14 @@ class MinerSession:
             await self.send_method("mining.notify", notify_params)
 
     async def handle_suggest_difficulty(self, msg_id, params):
-        """Honor the miner's suggested difficulty if reasonable."""
+        """Honor the miner's suggested difficulty, clamped to vardiff bounds."""
         if params and isinstance(params[0], (int, float)) and params[0] > 0:
-            suggested = params[0]
+            cfg = self.server.vardiff_config
+            suggested = max(cfg["min_diff"], min(cfg["max_diff"], params[0]))
             self.difficulty = suggested
-            log.info("Miner %s suggested difficulty %s, accepted", self.worker_name, suggested)
+            self.vardiff_frozen_until = time.time() + 300  # freeze vardiff for 5 min
+            log.info("Miner %s suggested difficulty %s, accepted (vardiff frozen 5m)",
+                     self.worker_name, suggested)
             await self.send_method("mining.set_difficulty", [self.difficulty])
 
     async def handle_authorize(self, msg_id, params):
@@ -748,6 +757,50 @@ class MinerSession:
         self.authorized = True
         log.info("Miner authorized: %s", self.worker_name)
         await self.send_result(msg_id, True)
+
+    def _maybe_retarget(self):
+        """Check if difficulty needs adjusting based on share rate.
+
+        Returns the new difficulty if changed, or None if no change needed.
+        """
+        cfg = self.server.vardiff_config
+        now = time.time()
+
+        # Don't retarget if frozen (miner used suggest_difficulty)
+        if now < self.vardiff_frozen_until:
+            return None
+
+        # Don't retarget too frequently
+        elapsed = now - self.vardiff_last_retarget
+        if elapsed < cfg["retarget_interval"]:
+            return None
+
+        # Calculate actual shares/min over the retarget window
+        cutoff = now - elapsed
+        recent = [t for t in self.vardiff_share_times if t > cutoff]
+        if not recent:
+            return None
+
+        shares_per_min = len(recent) / (elapsed / 60)
+        target_spm = cfg["target_shares_per_min"]
+
+        # Within tolerance band — no change needed
+        if abs(shares_per_min - target_spm) / target_spm < cfg["tolerance"]:
+            return None
+
+        # Proportional adjustment, capped at 4x change per retarget
+        ratio = shares_per_min / target_spm
+        ratio = max(0.25, min(4.0, ratio))
+        new_diff = self.difficulty * ratio
+
+        # Clamp to bounds
+        new_diff = max(cfg["min_diff"], min(cfg["max_diff"], new_diff))
+
+        # Apply
+        self.difficulty = new_diff
+        self.vardiff_last_retarget = now
+        self.vardiff_share_times.clear()
+        return new_diff  # caller sends mining.set_difficulty
 
     async def handle_submit(self, msg_id, params):
         """Handle mining.submit.
@@ -771,7 +824,7 @@ class MinerSession:
             log.debug("Stale share from %s: job %s not found", self.worker_name, job_id)
             return
 
-        # Skip if we already found a block for this job
+        # Skip validation if we already found a block for this job
         if getattr(job, 'block_found', False):
             self.server.stats["accepted"] += 1
             self.shares_accepted += 1
@@ -793,24 +846,19 @@ class MinerSession:
         # The actual version used in the header = base_version XOR rolled_bits.
         if version_hex:
             rolled_bits = int(version_hex, 16)
+            # Validate that rolled bits fall within the negotiated mask
+            if rolled_bits & ~self.version_rolling_mask:
+                self.server.stats["rejected"] += 1
+                self.shares_rejected += 1
+                await self.send_result(msg_id, None, [20, "Version rolling outside mask", None])
+                log.warning("Rejected share from %s: rolled bits %08x outside mask %08x",
+                            self.worker_name, rolled_bits, self.version_rolling_mask)
+                return
             header_version = job.version ^ rolled_bits
         else:
             header_version = job.version
 
-        self.server.stats["accepted"] += 1
-        self.shares_accepted += 1
-        self.last_share_time = time.time()
-        self.server.share_log.append((time.time(), self.difficulty))
-        await self.send_result(msg_id, True)
-
-        # Persist share to DB (fire-and-forget)
-        asyncio.ensure_future(self.server.db.record_share(
-            time.time(), self.worker_name, self.difficulty, job.height
-        ))
-
-        # Build header using correct byte ordering:
-        # - ntime: BE hex → LE bytes (reversed)
-        # - nonce: reversed (miners send in display order, header needs LE)
+        # Build header BEFORE accepting — validate the share meets difficulty
         ntime_bytes = bytes.fromhex(ntime_hex)[::-1]
         nonce_bytes = bytes.fromhex(nonce_hex)[::-1]
 
@@ -822,6 +870,42 @@ class MinerSession:
             )
             header_hash = sha256d(header)
             hash_int = uint256_from_bytes_le(header_hash)
+        except Exception as e:
+            log.error("Header build error from %s: %s", self.worker_name, e)
+            await self.send_result(msg_id, None, [20, "Internal error", None])
+            return
+
+        # Check share meets the miner's difficulty target
+        share_target = self.server.diff_to_target(self.difficulty)
+        if hash_int > share_target:
+            self.server.stats["rejected"] += 1
+            self.shares_rejected += 1
+            await self.send_result(msg_id, None, [23, "Low difficulty share", None])
+            log.debug("Low difficulty share from %s (diff=%.6f)", self.worker_name, self.difficulty)
+            return
+
+        # --- Share is valid — accept it ---
+        now = time.time()
+        self.server.stats["accepted"] += 1
+        self.shares_accepted += 1
+        self.last_share_time = now
+        self.vardiff_share_times.append(now)
+        self.server.share_log.append((now, self.difficulty))
+        await self.send_result(msg_id, True)
+
+        # Persist share to DB (fire-and-forget)
+        asyncio.ensure_future(self.server.db.record_share(
+            now, self.worker_name, self.difficulty, job.height
+        ))
+
+        # Vardiff: check if we should retarget this miner's difficulty
+        new_diff = self._maybe_retarget()
+        if new_diff is not None:
+            await self.send_method("mining.set_difficulty", [new_diff])
+            log.info("Vardiff: %s -> %.6f", self.worker_name, new_diff)
+
+        # Check if share also meets the network target (block found!)
+        try:
             network_target = int(job.target, 16)
 
             if hash_int <= network_target:
@@ -1827,6 +1911,19 @@ class StratumServer:
         self.default_difficulty = config.get("difficulty", 0.001)
         self.poll_interval = config.get("poll_interval", 15)
 
+        # Vardiff configuration
+        vd = config.get("vardiff", {})
+        self.vardiff_config = {
+            "min_diff": vd.get("min_diff", 0.0001),
+            "max_diff": vd.get("max_diff", 65536),
+            "target_shares_per_min": vd.get("target_shares_per_min", 6),
+            "retarget_interval": vd.get("retarget_interval", 90),
+            "tolerance": vd.get("tolerance", 0.3),
+        }
+
+        # BIP 310 version rolling — server-allowed mask
+        self.allowed_version_mask = int(config.get("version_rolling_mask", "1fffe000"), 16)
+
         self.payout_script = address_to_script(self.payout_address)
         self.extranonce1_size = 4
 
@@ -2183,11 +2280,13 @@ class StratumServer:
                 "ip": f"{m.addr[0]}:{m.addr[1]}" if m.addr else "unknown",
                 "difficulty": m.difficulty,
                 "shares": m.shares_accepted,
+                "rejected": m.shares_rejected,
                 "connected": f"{ch}h {cm}m {cs}s",
                 "last_share": (
                     f"{int(now - m.last_share_time)}s ago"
                     if m.last_share_time else "never"
                 ),
+                "version_rolling": bool(m.version_rolling_mask),
             })
 
         block_height = self.current_job.height if self.current_job else 0
