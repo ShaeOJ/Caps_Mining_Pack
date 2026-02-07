@@ -255,7 +255,7 @@ class RPCClient:
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode())
                 if data.get("error"):
                     log.error("RPC error: %s", data["error"])
@@ -571,6 +571,8 @@ class MinerSession:
         self.user_agent = "unknown"
         self.addr = writer.get_extra_info("peername")
         self._msg_id = 0
+        self._write_lock = asyncio.Lock()  # prevent concurrent writes to same socket
+        self._task = None  # set by handle_client after task creation
         self.connected_at = time.time()
         self.shares_accepted = 0
         self.last_share_time = None
@@ -614,7 +616,11 @@ class MinerSession:
         try:
             buffer = ""
             while True:
-                data = await self.reader.read(4096)
+                try:
+                    data = await asyncio.wait_for(self.reader.read(4096), timeout=60)
+                except asyncio.TimeoutError:
+                    log.info("Miner %s read timeout (60s idle), disconnecting", self.worker_name)
+                    break
                 if not data:
                     break
                 # Strip NUL bytes from raw data before decoding
@@ -634,7 +640,6 @@ class MinerSession:
         finally:
             log.info("Miner disconnected: %s [%s]", peer, self.worker_name)
             self.server.remove_miner(self)
-            self.writer.close()
 
     async def handle_message(self, msg):
         method = msg.get("method", "")
@@ -836,7 +841,9 @@ class MinerSession:
                 log.debug("extranonce1=%s extranonce2=%s ntime=%s nonce=%s",
                           self.extranonce1.hex(), extranonce2.hex(),
                           ntime_bytes.hex(), nonce_bytes.hex())
+                log.info("Submitting block to node...")
                 result = await self.server.rpc.acall("submitblock", [block_hex])
+                log.info("submitblock returned: %r", result)
                 if result is None or result == "":
                     log.info("Block submitted successfully! height=%d", job.height)
                     self.server.stats["blocks"] += 1
@@ -863,9 +870,11 @@ class MinerSession:
                     log.error("Block rejected by node: %s", result)
 
                 # Immediately refresh the template for the next block
+                log.info("Scheduling update_job after block found")
                 asyncio.ensure_future(self.server.update_job())
+                log.info("handle_submit block-found path complete")
         except Exception as e:
-            log.debug("Block check failed: %s", e)
+            log.error("Block check error: %s", e, exc_info=True)
 
     async def send_result(self, msg_id, result, error=None):
         msg = {"id": msg_id, "result": result, "error": error}
@@ -877,15 +886,18 @@ class MinerSession:
 
     async def _send(self, msg):
         try:
-            data = json.dumps(msg) + "\n"
-            self.writer.write(data.encode())
-            await asyncio.wait_for(self.writer.drain(), timeout=5)
+            async with self._write_lock:
+                data = json.dumps(msg) + "\n"
+                self.writer.write(data.encode())
+                await asyncio.wait_for(self.writer.drain(), timeout=5)
         except (ConnectionError, OSError):
             pass
         except asyncio.TimeoutError:
-            # Dead connection — close it so the miner gets removed
-            log.debug("Send timeout to %s, closing connection", self.worker_name)
-            self.writer.close()
+            log.debug("Send timeout to %s, aborting connection", self.worker_name)
+            try:
+                self.writer.transport.abort()
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -1857,12 +1869,33 @@ class StratumServer:
         except Exception:
             return "127.0.0.1"
 
+    async def _run_forever(self, name, coro_func):
+        """Run an async task forever, restarting on error."""
+        while True:
+            try:
+                await coro_func()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.error("Background task '%s' crashed: %s — restarting in 5s", name, e)
+                await asyncio.sleep(5)
+
     def find_job(self, job_id):
         return self.jobs.get(job_id)
 
     def remove_miner(self, miner):
         if miner in self.miners:
             self.miners.remove(miner)
+        # Cancel the miner's handle task and abort the transport.
+        # On Windows ProactorEventLoop, closing a socket with pending IOCP
+        # reads can freeze the event loop.  Cancelling the task first ensures
+        # the pending read is cancelled before the socket is closed.
+        if miner._task and not miner._task.done():
+            miner._task.cancel()
+        try:
+            miner.writer.transport.abort()
+        except Exception:
+            pass
 
     @staticmethod
     def diff_to_target(difficulty: float) -> int:
@@ -1876,12 +1909,14 @@ class StratumServer:
 
     async def update_job(self):
         """Fetch a new block template and create a job."""
+        log.debug("update_job: fetching template...")
         template = await self.rpc.acall(
             "getblocktemplate", [{"rules": ["segwit"]}]
         )
         if template is None:
             log.warning("Failed to get block template from node")
             return False
+        log.debug("update_job: got template height=%d", template.get("height", 0))
 
         new_prev = template["previousblockhash"]
         new_height = template["height"]
@@ -1929,26 +1964,29 @@ class StratumServer:
             self.last_notify_time = time.time()
             return
 
+        log.info("_notify_miners: sending to %d miners (clean=%s)", len(miners_snapshot), clean_jobs)
+
         async def _notify_one(miner):
             try:
                 await asyncio.wait_for(
                     miner.send_method("mining.notify", params), timeout=5
                 )
                 return True
-            except Exception:
+            except Exception as e:
+                log.warning("_notify_one failed for %s: %s", miner.worker_name, e)
                 return False
 
         results = await asyncio.gather(
             *[_notify_one(m) for m in miners_snapshot],
             return_exceptions=True,
         )
+        dead = 0
         for miner, ok in zip(miners_snapshot, results):
             if ok is not True:
+                dead += 1
                 self.remove_miner(miner)
-                try:
-                    miner.writer.close()
-                except Exception:
-                    pass
+        if dead:
+            log.info("_notify_miners: removed %d dead miners", dead)
         self.last_notify_time = time.time()
 
     async def _hashrate_sampler(self):
@@ -2005,10 +2043,20 @@ class StratumServer:
             except (AttributeError, OSError):
                 pass
         miner = MinerSession(reader, writer, self)
+        # Store the task handle so we can cancel it on forceful disconnect
+        miner._task = asyncio.current_task()
         self.miners.append(miner)
         await miner.handle()
 
     async def start(self):
+        # Install global exception handler so unhandled task errors are logged
+        loop = asyncio.get_event_loop()
+        def _exc_handler(loop, context):
+            msg = context.get("message", "Unhandled async exception")
+            exc = context.get("exception")
+            log.error("ASYNC ERROR: %s — %s", msg, exc)
+        loop.set_exception_handler(_exc_handler)
+
         log.info("=" * 60)
         log.info("C.A.P.S. S.M.S.D.")
         log.info("Cryptocurrency Acquisition & Processing System")
@@ -2044,17 +2092,12 @@ class StratumServer:
             log.error("Failed to get initial block template. Ensure the node is fully synced.")
             return
 
-        # Start polling loop
-        asyncio.ensure_future(self.poll_loop())
-
-        # Start hashrate sampler
-        asyncio.ensure_future(self._hashrate_sampler())
-
-        # Start background network stats updater (avoids RPC in HTTP handler)
-        asyncio.ensure_future(self._network_stats_updater())
-
-        # Start DB cleanup loop (hourly)
-        asyncio.ensure_future(self._db_cleanup_loop())
+        # Start background tasks (auto-restart on crash)
+        asyncio.ensure_future(self._run_forever("poll_loop", self.poll_loop))
+        asyncio.ensure_future(self._run_forever("hashrate_sampler", self._hashrate_sampler))
+        asyncio.ensure_future(self._run_forever("network_stats", self._network_stats_updater))
+        asyncio.ensure_future(self._run_forever("db_cleanup", self._db_cleanup_loop))
+        asyncio.ensure_future(self._run_forever("watchdog", self._event_loop_watchdog))
 
         # Start stratum listener
         server = await asyncio.start_server(
@@ -2074,7 +2117,7 @@ class StratumServer:
         log.info("=" * 60)
 
         # Stats printer
-        asyncio.ensure_future(self.stats_loop())
+        asyncio.ensure_future(self._run_forever("stats", self.stats_loop))
 
         async with server:
             await server.serve_forever()
@@ -2201,6 +2244,20 @@ class StratumServer:
             except Exception as e:
                 log.warning("DB cleanup error: %s", e)
 
+    async def _event_loop_watchdog(self):
+        """Log a warning if the event loop is unresponsive."""
+        tick = 0
+        while True:
+            t0 = time.time()
+            await asyncio.sleep(2)
+            elapsed = time.time() - t0
+            tick += 1
+            if tick % 5 == 0:  # every 10s
+                log.info("HEARTBEAT tick=%d miners=%d accepted=%d loop_ok=%.2fs",
+                         tick, len(self.miners), self.stats["accepted"], elapsed)
+            if elapsed > 5:
+                log.warning("EVENT LOOP STALL: slept 2s but %.1fs elapsed!", elapsed)
+
     async def stats_loop(self):
         """Print stats every 60 seconds."""
         while True:
@@ -2239,7 +2296,9 @@ def main():
     server = StratumServer(config)
 
     try:
-        asyncio.run(server.start())
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(server.start())
     except KeyboardInterrupt:
         log.info("Shutting down...")
 

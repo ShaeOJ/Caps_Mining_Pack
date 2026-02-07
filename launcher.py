@@ -741,7 +741,7 @@ def main():
                     shutdown()
                     return
 
-            # Check stratum
+            # Check stratum — auto-restart if it crashes
             if _stratum_proc and _stratum_proc.poll() is not None:
                 err(f"Stratum server exited unexpectedly (code {_stratum_proc.returncode})")
                 if _stratum_proc.stdout:
@@ -749,8 +749,10 @@ def main():
                     if remaining:
                         for line in remaining.decode("utf-8", errors="replace").splitlines()[-5:]:
                             err(f"  {line}")
-                shutdown()
-                return
+                warn("Restarting stratum server in 3 seconds...")
+                time.sleep(3)
+                _stratum_proc = start_stratum()
+                info(f"Stratum server restarted (PID {_stratum_proc.pid})")
 
             # Drain stratum output on non-Windows
             if not IS_WINDOWS and _stratum_proc:
