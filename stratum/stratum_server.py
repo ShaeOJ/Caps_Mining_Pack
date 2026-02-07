@@ -2147,7 +2147,6 @@ class StratumServer:
         try:
             request_line = await asyncio.wait_for(reader.readline(), timeout=5)
             if not request_line:
-                writer.close()
                 return
 
             # Read remaining headers (discard)
@@ -2196,6 +2195,7 @@ class StratumServer:
         finally:
             try:
                 writer.close()
+                await writer.wait_closed()
             except Exception:
                 pass
 
