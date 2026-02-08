@@ -41,6 +41,42 @@ def load_config():
         return json.load(f)
 
 
+def validate_settings(data: dict) -> list:
+    """Validate settings dict. Returns list of error strings (empty = valid)."""
+    errors = []
+    for field in ("rpc_host", "rpc_port", "rpc_user", "payout_address"):
+        if not data.get(field):
+            errors.append(f"Missing required field: {field}")
+    for port_field in ("rpc_port", "stratum_port", "dashboard_port"):
+        v = data.get(port_field)
+        if v is not None:
+            try:
+                iv = int(v)
+                if iv < 1 or iv > 65535:
+                    errors.append(f"{port_field} must be 1-65535")
+            except (ValueError, TypeError):
+                errors.append(f"{port_field} must be an integer")
+    for vb in ("p2pkh_version", "p2sh_version"):
+        v = data.get(vb)
+        if v is not None:
+            try:
+                iv = int(v)
+                if iv < 0 or iv > 255:
+                    errors.append(f"{vb} must be 0-255")
+            except (ValueError, TypeError):
+                errors.append(f"{vb} must be an integer")
+    for pos_field in ("difficulty", "poll_interval"):
+        v = data.get(pos_field)
+        if v is not None:
+            try:
+                fv = float(v)
+                if fv <= 0:
+                    errors.append(f"{pos_field} must be a positive number")
+            except (ValueError, TypeError):
+                errors.append(f"{pos_field} must be a number")
+    return errors
+
+
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
@@ -100,12 +136,12 @@ def script_number(n: int) -> bytes:
     return bytes([len(result)]) + bytes(result)
 
 
-def address_to_script(address: str) -> bytes:
-    """Convert a Caps address to its output script (P2PKH or P2SH)."""
-    import base64
-
+def address_to_script(address: str, bech32_hrp: str = "caps",
+                      p2pkh_version: int = 0x1C, p2sh_version: int = 0x1D) -> bytes:
+    """Convert an address to its output script (P2PKH, P2SH, bech32, or CashAddr)."""
     # Try bech32 first
-    if address.lower().startswith("caps1"):
+    bech32_prefix = bech32_hrp + "1"
+    if bech32_hrp and address.lower().startswith(bech32_prefix):
         hrp, data = bech32_decode(address)
         if data is not None:
             witness_ver = data[0]
@@ -117,16 +153,35 @@ def address_to_script(address: str) -> bytes:
             elif witness_ver == 1 and len(witness_prog) == 32:
                 return bytes([0x51, 0x20]) + witness_prog
 
+    # Try CashAddr (Bitcoin Cash: "bitcoincash:q..." or bare "q..."/"p...")
+    lower = address.lower()
+    if lower.startswith("bitcoincash:") or lower.startswith("bchtest:"):
+        result = cashaddr_decode(address)
+        if result is not None:
+            prefix, addr_type, hash_bytes = result
+            if addr_type == 0:  # P2PKH
+                return bytes([0x76, 0xA9, 0x14]) + hash_bytes + bytes([0x88, 0xAC])
+            elif addr_type == 1:  # P2SH
+                return bytes([0xA9, 0x14]) + hash_bytes + bytes([0x87])
+
     # Base58Check decode
     raw = base58_decode_check(address)
     if raw is None:
+        # Last resort: try CashAddr without prefix (bare "q..."/"p..." form)
+        result = cashaddr_decode(address)
+        if result is not None:
+            prefix, addr_type, hash_bytes = result
+            if addr_type == 0:
+                return bytes([0x76, 0xA9, 0x14]) + hash_bytes + bytes([0x88, 0xAC])
+            elif addr_type == 1:
+                return bytes([0xA9, 0x14]) + hash_bytes + bytes([0x87])
         raise ValueError(f"Cannot decode address: {address}")
 
     version = raw[0]
     payload = raw[1:]
-    if version == 0x1C:  # P2PKH (Caps mainnet)
+    if version == p2pkh_version:
         return bytes([0x76, 0xA9, 0x14]) + payload + bytes([0x88, 0xAC])
-    elif version == 0x1D:  # P2SH (Caps mainnet)
+    elif version == p2sh_version:
         return bytes([0xA9, 0x14]) + payload + bytes([0x87])
     else:
         raise ValueError(f"Unknown address version: {version}")
@@ -219,6 +274,75 @@ def bech32_convert_bits(data, frombits, tobits, pad=True):
     elif bits >= frombits or ((acc << (tobits - bits)) & maxv):
         return None
     return ret
+
+
+# ---------------------------------------------------------------------------
+# CashAddr helpers (Bitcoin Cash address format)
+# ---------------------------------------------------------------------------
+CASHADDR_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+CASHADDR_PREFIX = "bitcoincash"
+
+
+def _cashaddr_polymod(values):
+    gen = [0x98F2BC8E61, 0x79B76D99E2, 0xF33E5FB3C4, 0xAE2EABE2A8, 0x1E4F43E470]
+    chk = 1
+    for v in values:
+        b = chk >> 35
+        chk = ((chk & 0x07FFFFFFFF) << 5) ^ v
+        for i in range(5):
+            chk ^= gen[i] if ((b >> i) & 1) else 0
+    return chk ^ 1
+
+
+def _cashaddr_prefix_expand(prefix):
+    return [ord(c) & 0x1F for c in prefix] + [0]
+
+
+def cashaddr_decode(address: str):
+    """Decode a CashAddr address. Returns (prefix, version_byte, payload_hash) or None.
+
+    Accepts both 'bitcoincash:qr...' and bare 'qr...' forms.
+    version_byte: 0 = P2PKH, 1 = P2SH (8 = P2SH in raw encoding, mapped to 1).
+    """
+    addr_lower = address.lower()
+    if ":" in addr_lower:
+        prefix, payload_str = addr_lower.split(":", 1)
+    else:
+        prefix = CASHADDR_PREFIX
+        payload_str = addr_lower
+
+    # Decode base32
+    data5 = []
+    for c in payload_str:
+        idx = CASHADDR_CHARSET.find(c)
+        if idx == -1:
+            return None
+        data5.append(idx)
+
+    # Verify checksum (8 x 5-bit words = 40-bit checksum)
+    if len(data5) < 9:
+        return None
+    prefix_exp = _cashaddr_prefix_expand(prefix)
+    if _cashaddr_polymod(prefix_exp + data5) != 0:
+        return None
+
+    # Strip checksum (last 8 groups)
+    data5 = data5[:-8]
+
+    # Convert from 5-bit to 8-bit
+    data8 = bech32_convert_bits(data5, 5, 8, False)
+    if data8 is None or len(data8) < 1:
+        return None
+
+    # First byte encodes type (high 4 bits) and size (low 4 bits)
+    version_byte = data8[0]
+    addr_type = (version_byte >> 3) & 0x1F  # 0 = P2PKH, 1 = P2SH
+    hash_bytes = bytes(data8[1:])
+
+    if len(hash_bytes) != 20:
+        return None
+
+    return (prefix, addr_type, hash_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +447,8 @@ def build_merkle_from_txids(coinbase_hash: bytes, tx_hashes: list) -> bytes:
 class Job:
     _counter = 0
 
-    def __init__(self, template: dict, payout_script: bytes, extranonce1_size: int):
+    def __init__(self, template: dict, payout_script: bytes, extranonce1_size: int,
+                 coinbase_message: str = "/Caps Stratum Pool/"):
         Job._counter += 1
         self.job_id = format(Job._counter, "x")
         self.template = template
@@ -338,6 +463,7 @@ class Job:
         self.payout_script = payout_script
         self.extranonce1_size = extranonce1_size
         self.extranonce2_size = 4
+        self._coinbase_message = coinbase_message
 
         # Build coinbase halves
         self._build_coinbase()
@@ -352,7 +478,7 @@ class Job:
         """Construct coinbase1 and coinbase2 with extranonce placeholder."""
         # Coinbase input script: height (BIP34) + arbitrary data
         height_script = script_number(self.height)
-        coinbase_message = b"/Caps Stratum Pool/"
+        coinbase_message = self._coinbase_message.encode("utf-8")
         script_sig = height_script + coinbase_message
 
         # We split the coinbase tx so the extranonce goes between coinbase1 and coinbase2.
@@ -1040,6 +1166,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   --pip-panel: rgba(20, 254, 23, 0.05);
   --pip-border: rgba(20, 254, 23, 0.3);
   --pip-glow: 0 0 10px rgba(20, 254, 23, 0.3);
+  --pip-scanline: rgba(20, 254, 23, 0.03);
   --pip-amber: #ffc107;
   --pip-red: #ff3d3d;
 }
@@ -1047,7 +1174,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
 body {
-  background: var(--pip-bg);
+  background:
+    repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 3px,
+      var(--pip-scanline) 3px,
+      var(--pip-scanline) 4px
+    ),
+    var(--pip-bg);
   color: var(--pip-green);
   font-family: 'Share Tech Mono', monospace;
   min-height: 100vh;
@@ -1063,8 +1198,8 @@ body::after {
     0deg,
     transparent,
     transparent 2px,
-    rgba(0, 0, 0, 0.15) 2px,
-    rgba(0, 0, 0, 0.15) 4px
+    rgba(0, 0, 0, 0.12) 2px,
+    rgba(0, 0, 0, 0.12) 4px
   );
   pointer-events: none;
   z-index: 9999;
@@ -1110,7 +1245,7 @@ body::before {
   font-size: 28px;
   font-weight: 900;
   letter-spacing: 4px;
-  text-shadow: var(--pip-glow), 0 0 20px rgba(20, 254, 23, 0.2);
+  text-shadow: var(--pip-glow), 0 0 20px var(--pip-green-dark);
   color: var(--pip-green);
 }
 
@@ -1210,12 +1345,12 @@ thead th {
 
 tbody td {
   padding: 8px 10px;
-  border-bottom: 1px solid rgba(20, 254, 23, 0.08);
+  border-bottom: 1px solid var(--pip-green-dark);
   white-space: nowrap;
 }
 
 tbody tr:hover {
-  background: rgba(20, 254, 23, 0.06);
+  background: var(--pip-panel);
 }
 
 .status-dot {
@@ -1289,12 +1424,12 @@ tbody tr:hover {
 
 /* Connection Info */
 .connect-box {
-  background: rgba(20,254,23,0.06);
+  background: var(--pip-panel);
   border: 1px solid var(--pip-green);
   border-radius: 8px;
   padding: 16px 20px;
   margin-bottom: 20px;
-  box-shadow: 0 0 12px rgba(20,254,23,0.08);
+  box-shadow: var(--pip-glow);
 }
 .connect-box .section-title { margin-bottom: 10px; }
 .connect-row {
@@ -1306,7 +1441,7 @@ tbody tr:hover {
   flex-wrap: wrap;
 }
 .connect-label {
-  color: rgba(20,254,23,0.6);
+  color: var(--pip-green-dim);
   font-family: 'Orbitron', sans-serif;
   font-size: 11px;
   min-width: 90px;
@@ -1319,16 +1454,16 @@ tbody tr:hover {
   background: rgba(0,0,0,0.4);
   padding: 4px 12px;
   border-radius: 4px;
-  border: 1px solid rgba(20,254,23,0.2);
+  border: 1px solid var(--pip-border);
   user-select: all;
   cursor: pointer;
 }
 .connect-value:hover {
-  background: rgba(20,254,23,0.12);
+  background: var(--pip-panel);
   border-color: var(--pip-green);
 }
 .connect-hint {
-  color: rgba(20,254,23,0.4);
+  color: var(--pip-green-dim);
   font-size: 11px;
   font-style: italic;
 }
@@ -1344,7 +1479,7 @@ tbody tr:hover {
   padding: 30px 50px;
   z-index: 10000;
   text-align: center;
-  box-shadow: 0 0 50px rgba(20, 254, 23, 0.5), inset 0 0 30px rgba(20, 254, 23, 0.1);
+  box-shadow: var(--pip-glow), inset 0 0 30px var(--pip-green-dark);
   animation: blockFoundPop 3s ease-out forwards;
 }
 
@@ -1393,8 +1528,8 @@ tbody tr:hover {
 }
 
 @keyframes iconPulse {
-  from { text-shadow: 0 0 10px rgba(20, 254, 23, 0.5); }
-  to { text-shadow: 0 0 30px rgba(20, 254, 23, 0.9), 0 0 50px rgba(20, 254, 23, 0.5); }
+  from { text-shadow: var(--pip-glow); }
+  to { text-shadow: var(--pip-glow), 0 0 50px var(--pip-green-dark); }
 }
 
 /* Stat value flash on change */
@@ -1402,7 +1537,7 @@ tbody tr:hover {
   animation: valFlash 0.6s ease;
 }
 @keyframes valFlash {
-  0% { text-shadow: 0 0 15px rgba(20,254,23,0.8); }
+  0% { text-shadow: var(--pip-glow), 0 0 15px var(--pip-green-dim); }
   100% { text-shadow: var(--pip-glow); }
 }
 
@@ -1416,7 +1551,7 @@ tbody tr {
   display: inline-block;
   font-size: 9px;
   font-family: 'Orbitron', sans-serif;
-  background: rgba(20,254,23,0.15);
+  background: var(--pip-panel);
   border: 1px solid var(--pip-green-dim);
   color: var(--pip-green);
   padding: 1px 4px;
@@ -1437,8 +1572,85 @@ tbody tr {
   pointer-events: none;
   white-space: nowrap;
   z-index: 10;
-  box-shadow: 0 0 8px rgba(20,254,23,0.3);
+  box-shadow: var(--pip-glow);
   display: none;
+}
+
+/* Settings gear */
+.settings-btn {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 32px;
+  height: 32px;
+  background: none;
+  border: 1px solid var(--pip-border);
+  color: var(--pip-green-dim);
+  font-size: 18px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.2s, border-color 0.2s, transform 0.3s;
+  z-index: 10;
+}
+.settings-btn:hover {
+  color: var(--pip-green);
+  border-color: var(--pip-green);
+  transform: rotate(30deg);
+}
+
+/* Settings panel */
+.settings-panel {
+  position: absolute;
+  top: 48px;
+  right: 12px;
+  background: var(--pip-bg);
+  border: 1px solid var(--pip-border);
+  padding: 12px 14px;
+  z-index: 20;
+  display: none;
+  box-shadow: 0 0 15px rgba(0,0,0,0.6);
+}
+.settings-panel.open { display: block; }
+.settings-panel-title {
+  font-family: 'Orbitron', sans-serif;
+  font-size: 9px;
+  letter-spacing: 2px;
+  color: var(--pip-green-dim);
+  margin-bottom: 8px;
+  text-transform: uppercase;
+}
+.theme-swatches {
+  display: flex;
+  gap: 8px;
+}
+.theme-swatch {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 2px solid rgba(255,255,255,0.15);
+  cursor: pointer;
+  transition: transform 0.15s, border-color 0.2s, box-shadow 0.2s;
+  position: relative;
+}
+.theme-swatch:hover {
+  transform: scale(1.2);
+}
+.theme-swatch.active {
+  border-color: #fff;
+  box-shadow: 0 0 8px currentColor;
+}
+
+/* Hash background canvas */
+#hashBg {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: -1;
+  pointer-events: none;
 }
 
 /* Responsive */
@@ -1452,8 +1664,15 @@ tbody tr {
 </style>
 </head>
 <body>
+<canvas id="hashBg"></canvas>
 <div class="container">
   <div class="header">
+    <button class="settings-btn" id="settingsBtn" title="Settings">&#9881;</button>
+    <div class="settings-panel" id="settingsPanel">
+      <div class="settings-panel-title">Accent Color</div>
+      <div class="theme-swatches" id="themeSwatches"></div>
+      <a href="/settings" style="display:block;margin-top:10px;color:var(--pip-green-dim);font-size:12px;text-decoration:none;border-top:1px solid var(--pip-border);padding-top:8px;transition:color 0.2s" onmouseover="this.style.color='var(--pip-green)'" onmouseout="this.style.color='var(--pip-green-dim)'" >&#9881; Server Settings</a>
+    </div>
     <h1>C.A.P.S. S.M.S.D.</h1>
     <div class="header-acronym">Cryptocurrency Acquisition & Processing System - Stratum Mining Services Dashboard</div>
     <div class="subtitle">BLOCK HEIGHT: <span id="blockHeight">---</span> | PORT: <span id="stratumPort">---</span></div>
@@ -1559,11 +1778,358 @@ tbody tr {
 
   <div class="footer">
     <div class="payout">PAYOUT: <span id="payoutAddr">---</span></div>
-    <div>CAPS Stratum Server &bull; Vault-Tec Industries</div>
+    <div><span id="footerCoin">CAPS</span> Stratum Server &bull; Vault-Tec Industries</div>
   </div>
 </div>
 
 <script>
+/* ---- Theme system ---- */
+var THEMES = {
+  green:  { primary: '#14fe17', dim: '#0a8f0c', dark: '#063f07' },
+  amber:  { primary: '#ffb000', dim: '#8f6a00', dark: '#3f2f00' },
+  cyan:   { primary: '#00d4ff', dim: '#007a8f', dark: '#003540' },
+  red:    { primary: '#ff3d3d', dim: '#8f2222', dark: '#3f0f0f' },
+  violet: { primary: '#b44aff', dim: '#6a2e8f', dark: '#2f1440' },
+  white:  { primary: '#e0e0e0', dim: '#808080', dark: '#404040' }
+};
+
+function hexToRgb(hex) {
+  var r = parseInt(hex.slice(1,3), 16);
+  var g = parseInt(hex.slice(3,5), 16);
+  var b = parseInt(hex.slice(5,7), 16);
+  return { r: r, g: g, b: b };
+}
+
+function applyTheme(name) {
+  var t = THEMES[name];
+  if (!t) t = THEMES.green;
+  var root = document.documentElement.style;
+  var c = hexToRgb(t.primary);
+  root.setProperty('--pip-green', t.primary);
+  root.setProperty('--pip-green-dim', t.dim);
+  root.setProperty('--pip-green-dark', t.dark);
+  root.setProperty('--pip-panel', 'rgba(' + c.r + ',' + c.g + ',' + c.b + ',0.05)');
+  root.setProperty('--pip-border', 'rgba(' + c.r + ',' + c.g + ',' + c.b + ',0.3)');
+  root.setProperty('--pip-glow', '0 0 10px rgba(' + c.r + ',' + c.g + ',' + c.b + ',0.3)');
+  root.setProperty('--pip-scanline', 'rgba(' + c.r + ',' + c.g + ',' + c.b + ',0.03)');
+  try { localStorage.setItem('caps-theme', name); } catch(e) {}
+  try { fetch('/api/preferences',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({theme:name})}); } catch(e) {}
+  // Update swatch active state
+  var swatches = document.querySelectorAll('.theme-swatch');
+  swatches.forEach(function(sw) {
+    sw.classList.toggle('active', sw.dataset.theme === name);
+  });
+}
+
+(function initThemeUI() {
+  var container = document.getElementById('themeSwatches');
+  var btn = document.getElementById('settingsBtn');
+  var panel = document.getElementById('settingsPanel');
+  if (!container || !btn || !panel) return;
+
+  // Build swatches
+  var names = Object.keys(THEMES);
+  names.forEach(function(name) {
+    var swatch = document.createElement('div');
+    swatch.className = 'theme-swatch';
+    swatch.dataset.theme = name;
+    swatch.style.background = THEMES[name].primary;
+    swatch.title = name.charAt(0).toUpperCase() + name.slice(1);
+    swatch.addEventListener('click', function() {
+      applyTheme(name);
+    });
+    container.appendChild(swatch);
+  });
+
+  // Toggle panel
+  btn.addEventListener('click', function(e) {
+    e.stopPropagation();
+    panel.classList.toggle('open');
+  });
+  document.addEventListener('click', function(e) {
+    if (!panel.contains(e.target) && e.target !== btn) {
+      panel.classList.remove('open');
+    }
+  });
+
+  // Load saved theme: try server first, fall back to localStorage
+  var localTheme = null;
+  try { localTheme = localStorage.getItem('caps-theme'); } catch(e) {}
+  applyTheme(localTheme || 'green');
+  fetch('/api/preferences').then(function(r){return r.json();}).then(function(p){
+    if (p.theme && p.theme !== (localTheme || 'green')) applyTheme(p.theme);
+  }).catch(function(){});
+})();
+
+/* ---- Hash background animation ---- */
+(function initHashBg() {
+  var canvas = document.getElementById('hashBg');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+  var W, H, dpr;
+  var fragments = [];
+  var HEX = '0123456789abcdef';
+  var FRAG_COUNT = 25;
+  var MERGE_INTERVAL = 5000;
+  var BLOCK_INTERVAL = 20000;
+  var lastMerge = 0;
+  var lastBlock = 0;
+  var blockFlashes = [];
+  var frameSkip = false;
+  var running = true;
+
+  function resize() {
+    dpr = window.devicePixelRatio || 1;
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W * dpr;
+    canvas.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  function randHex(len) {
+    var s = '';
+    for (var i = 0; i < len; i++) s += HEX[Math.floor(Math.random() * 16)];
+    return s;
+  }
+
+  var globalPulse = 0;
+  var exploding = 0;
+  var explosionParticles = [];
+
+  function createFragment() {
+    var len = 8 + Math.floor(Math.random() * 9);
+    return {
+      x: Math.random() * W,
+      y: Math.random() * H,
+      vx: (Math.random() - 0.5) * 0.3,
+      vy: -(0.1 + Math.random() * 0.2),
+      text: randHex(len),
+      opacity: 0.06 + Math.random() * 0.04,
+      baseOpacity: 0,
+      size: 10 + Math.floor(Math.random() * 4),
+      mergeCount: 0,
+      pulse: 0
+    };
+  }
+
+  // Called from refresh() when new shares arrive
+  window.hashBgPulse = function() {
+    globalPulse = 1.0;
+  };
+
+  // Called from refresh() on rejected share — explode outward from center
+  window.hashBgExplode = function() {
+    exploding = 1.0;
+    var cx = W / 2, cy = H / 2;
+    // Blast all fragments outward from center
+    for (var i = 0; i < fragments.length; i++) {
+      var f = fragments[i];
+      var dx = f.x - cx, dy = f.y - cy;
+      var dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      f.vx = (dx / dist) * (3 + Math.random() * 3);
+      f.vy = (dy / dist) * (3 + Math.random() * 3);
+      f.pulse = 1.0;
+    }
+    // Spawn red explosion particles from center
+    for (var i = 0; i < 20; i++) {
+      var angle = Math.random() * Math.PI * 2;
+      var speed = 2 + Math.random() * 4;
+      explosionParticles.push({
+        x: cx, y: cy,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        life: 1.0,
+        text: randHex(4 + Math.floor(Math.random() * 5))
+      });
+    }
+  };
+
+  function init() {
+    resize();
+    fragments = [];
+    for (var i = 0; i < FRAG_COUNT; i++) fragments.push(createFragment());
+    fragments.forEach(function(f) { f.baseOpacity = f.opacity; });
+    lastMerge = performance.now();
+    lastBlock = performance.now();
+  }
+
+  function getThemeColor() {
+    var c = getComputedStyle(document.documentElement).getPropertyValue('--pip-green').trim();
+    return c || '#14fe17';
+  }
+
+  function update(now) {
+    // Decay global pulse (share flash)
+    if (globalPulse > 0) {
+      globalPulse *= 0.97;
+      if (globalPulse < 0.005) globalPulse = 0;
+    }
+
+    // Decay explosion state
+    if (exploding > 0) {
+      exploding *= 0.97;
+      if (exploding < 0.005) exploding = 0;
+    }
+
+    // Move fragments
+    for (var i = 0; i < fragments.length; i++) {
+      var f = fragments[i];
+      // Drag fragments back to normal drift after explosion
+      if (exploding > 0) {
+        f.vx *= 0.97;
+        f.vy *= 0.97;
+      } else {
+        // Gently restore normal drift speeds
+        var targetVx = (Math.random() - 0.5) * 0.3;
+        var targetVy = -(0.1 + Math.random() * 0.2);
+        if (Math.abs(f.vx) > 0.5) f.vx *= 0.95;
+        if (Math.abs(f.vy) > 0.5) f.vy *= 0.95;
+      }
+      f.x += f.vx;
+      f.y += f.vy;
+      // Wrap around edges
+      if (f.x < -100) f.x = W + 50;
+      if (f.x > W + 100) f.x = -50;
+      if (f.y < -30) f.y = H + 20;
+      if (f.y > H + 30) f.y = -20;
+      // Decay per-fragment pulse (merge flash)
+      if (f.pulse > 0) {
+        f.pulse *= 0.95;
+        if (f.pulse < 0.001) f.pulse = 0;
+      }
+      // Combine base + merge pulse + global share pulse
+      f.opacity = f.baseOpacity + f.pulse * 0.15 + globalPulse * 0.12;
+    }
+
+    // Update explosion particles
+    for (var i = explosionParticles.length - 1; i >= 0; i--) {
+      var ep = explosionParticles[i];
+      ep.x += ep.vx;
+      ep.y += ep.vy;
+      ep.vx *= 0.98;
+      ep.vy *= 0.98;
+      ep.life -= 0.02;
+      if (ep.life <= 0) explosionParticles.splice(i, 1);
+    }
+
+    // Merge check
+    if (now - lastMerge > MERGE_INTERVAL && fragments.length >= 2) {
+      lastMerge = now;
+      // Find two closest fragments
+      var bestDist = Infinity, ai = -1, bi = -1;
+      for (var i = 0; i < fragments.length; i++) {
+        for (var j = i + 1; j < fragments.length; j++) {
+          var dx = fragments[i].x - fragments[j].x;
+          var dy = fragments[i].y - fragments[j].y;
+          var d = dx * dx + dy * dy;
+          if (d < bestDist) { bestDist = d; ai = i; bi = j; }
+        }
+      }
+      if (ai >= 0 && bi >= 0) {
+        var a = fragments[ai];
+        var b = fragments[bi];
+        // Merge: a absorbs b
+        a.text = (a.text + b.text).substring(0, 16);
+        a.mergeCount++;
+        a.pulse = 1;
+        a.x = (a.x + b.x) / 2;
+        a.y = (a.y + b.y) / 2;
+        // Replace b with a new fragment
+        fragments[bi] = createFragment();
+        fragments[bi].baseOpacity = fragments[bi].opacity;
+      }
+    }
+
+    // Block formation check
+    if (now - lastBlock > BLOCK_INTERVAL) {
+      lastBlock = now;
+      // Find a fragment with enough merges
+      for (var i = 0; i < fragments.length; i++) {
+        if (fragments[i].mergeCount >= 3) {
+          blockFlashes.push({
+            x: fragments[i].x,
+            y: fragments[i].y,
+            life: 1.0
+          });
+          // Reset the fragment
+          fragments[i] = createFragment();
+          fragments[i].baseOpacity = fragments[i].opacity;
+          break;
+        }
+      }
+    }
+
+    // Decay block flashes
+    for (var i = blockFlashes.length - 1; i >= 0; i--) {
+      blockFlashes[i].life -= 0.015;
+      if (blockFlashes[i].life <= 0) blockFlashes.splice(i, 1);
+    }
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+    var color = getThemeColor();
+    var rgb = hexToRgb(color);
+    // Blend toward red during explosion
+    var dr = rgb.r + (255 - rgb.r) * exploding;
+    var dg = rgb.g * (1 - exploding * 0.85);
+    var db = rgb.b * (1 - exploding * 0.85);
+
+    // Draw fragments
+    for (var i = 0; i < fragments.length; i++) {
+      var f = fragments[i];
+      ctx.font = f.size + 'px "Share Tech Mono", monospace';
+      var fo = exploding > 0 ? Math.min(f.opacity + exploding * 0.2, 0.5) : f.opacity;
+      ctx.fillStyle = 'rgba(' + Math.round(dr) + ',' + Math.round(dg) + ',' + Math.round(db) + ',' + fo.toFixed(3) + ')';
+      ctx.fillText(f.text, f.x, f.y);
+    }
+
+    // Draw explosion particles (always red)
+    for (var i = 0; i < explosionParticles.length; i++) {
+      var ep = explosionParticles[i];
+      ctx.font = '11px "Share Tech Mono", monospace';
+      ctx.fillStyle = 'rgba(255,61,61,' + (ep.life * 0.4).toFixed(3) + ')';
+      ctx.fillText(ep.text, ep.x, ep.y);
+    }
+
+    // Draw block flashes
+    for (var i = 0; i < blockFlashes.length; i++) {
+      var bf = blockFlashes[i];
+      var a = bf.life * 0.2;
+      ctx.strokeStyle = 'rgba(' + rgb.r + ',' + rgb.g + ',' + rgb.b + ',' + a.toFixed(3) + ')';
+      ctx.lineWidth = 1.5;
+      var s = 20 + (1 - bf.life) * 15;
+      ctx.strokeRect(bf.x - s, bf.y - s * 0.6, s * 2, s * 1.2);
+      // Inner glow text
+      ctx.fillStyle = 'rgba(' + rgb.r + ',' + rgb.g + ',' + rgb.b + ',' + (a * 0.8).toFixed(3) + ')';
+      ctx.font = '9px "Orbitron", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('BLOCK', bf.x, bf.y + 3);
+      ctx.textAlign = 'left';
+    }
+  }
+
+  function loop(ts) {
+    if (!running) return;
+    if (document.hidden) { requestAnimationFrame(loop); return; }
+    // Throttle to ~30fps
+    frameSkip = !frameSkip;
+    if (frameSkip) { requestAnimationFrame(loop); return; }
+    update(ts);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  window.addEventListener('resize', resize);
+  document.addEventListener('visibilitychange', function() {
+    if (!document.hidden && running) requestAnimationFrame(loop);
+  });
+
+  init();
+  requestAnimationFrame(loop);
+})();
+
 function formatTime(ts) {
   var d = new Date(ts * 1000);
   return d.toLocaleString();
@@ -1669,6 +2235,11 @@ var graphHoverIdx = -1;
 var graphPadL = 80, graphPadR = 15, graphPadT = 10, graphPadB = 25;
 var graphPulsePhase = 0;
 
+function getThemeRgb() {
+  var hex = getComputedStyle(document.documentElement).getPropertyValue('--pip-green').trim() || '#14fe17';
+  return hexToRgb(hex);
+}
+
 function drawHashrateGraph(history) {
   var canvas = document.getElementById('hashrateGraph');
   if (!canvas) return;
@@ -1683,12 +2254,16 @@ function drawHashrateGraph(history) {
 
   ctx.clearRect(0, 0, w, h);
 
+  var tc = getThemeRgb();
+  var R = tc.r, G = tc.g, B = tc.b;
+  var primary = getComputedStyle(document.documentElement).getPropertyValue('--pip-green').trim() || '#14fe17';
+
   var padL = graphPadL, padR = graphPadR, padT = graphPadT, padB = graphPadB;
   var gw = w - padL - padR;
   var gh = h - padT - padB;
 
   if (!history || history.length < 2) {
-    ctx.fillStyle = 'rgba(20,254,23,0.3)';
+    ctx.fillStyle = 'rgba(' + R + ',' + G + ',' + B + ',0.3)';
     ctx.font = '12px "Share Tech Mono", monospace';
     ctx.textAlign = 'center';
     ctx.fillText('Waiting for data...', w / 2, h / 2);
@@ -1699,7 +2274,7 @@ function drawHashrateGraph(history) {
   var cutoff = history[history.length - 1].t - 1800;
   history = history.filter(function(p) { return p.t >= cutoff; });
   if (history.length < 2) {
-    ctx.fillStyle = 'rgba(20,254,23,0.3)';
+    ctx.fillStyle = 'rgba(' + R + ',' + G + ',' + B + ',0.3)';
     ctx.font = '12px "Share Tech Mono", monospace';
     ctx.textAlign = 'center';
     ctx.fillText('Waiting for data...', w / 2, h / 2);
@@ -1723,7 +2298,7 @@ function drawHashrateGraph(history) {
   if (tRange <= 0) tRange = 1;
 
   // Grid lines
-  ctx.strokeStyle = 'rgba(20,254,23,0.1)';
+  ctx.strokeStyle = 'rgba(' + R + ',' + G + ',' + B + ',0.1)';
   ctx.lineWidth = 1;
   var gridRows = 4;
   for (var i = 0; i <= gridRows; i++) {
@@ -1737,7 +2312,7 @@ function drawHashrateGraph(history) {
   // Y-axis labels
   var axisRange = axisMax - axisMin;
   if (axisRange <= 0) axisRange = 1;
-  ctx.fillStyle = 'rgba(20,254,23,0.5)';
+  ctx.fillStyle = 'rgba(' + R + ',' + G + ',' + B + ',0.5)';
   ctx.font = '10px "Share Tech Mono", monospace';
   ctx.textAlign = 'right';
   for (var i = 0; i <= gridRows; i++) {
@@ -1797,15 +2372,15 @@ function drawHashrateGraph(history) {
   ctx.lineTo(points[points.length - 1].x, padT + gh);
   ctx.closePath();
   var grad = ctx.createLinearGradient(0, padT, 0, padT + gh);
-  grad.addColorStop(0, 'rgba(20,254,23,0.25)');
-  grad.addColorStop(1, 'rgba(20,254,23,0.02)');
+  grad.addColorStop(0, 'rgba(' + R + ',' + G + ',' + B + ',0.25)');
+  grad.addColorStop(1, 'rgba(' + R + ',' + G + ',' + B + ',0.02)');
   ctx.fillStyle = grad;
   ctx.fill();
 
   // Line with glow (smooth)
-  ctx.shadowColor = 'rgba(20,254,23,0.6)';
+  ctx.shadowColor = 'rgba(' + R + ',' + G + ',' + B + ',0.6)';
   ctx.shadowBlur = 6;
-  ctx.strokeStyle = '#14fe17';
+  ctx.strokeStyle = primary;
   ctx.lineWidth = 2;
   ctx.beginPath();
   smoothLine(ctx, points);
@@ -1818,8 +2393,8 @@ function drawHashrateGraph(history) {
   var pulseR = 4 + Math.sin(graphPulsePhase) * 2;
   ctx.beginPath();
   ctx.arc(last.x, last.y, pulseR, 0, 2 * Math.PI);
-  ctx.fillStyle = '#14fe17';
-  ctx.shadowColor = 'rgba(20,254,23,0.8)';
+  ctx.fillStyle = primary;
+  ctx.shadowColor = 'rgba(' + R + ',' + G + ',' + B + ',0.8)';
   ctx.shadowBlur = 10;
   ctx.fill();
   ctx.shadowBlur = 0;
@@ -1828,7 +2403,7 @@ function drawHashrateGraph(history) {
   if (graphHoverIdx >= 0 && graphHoverIdx < points.length) {
     var hp = points[graphHoverIdx];
     // Vertical crosshair
-    ctx.strokeStyle = 'rgba(20,254,23,0.4)';
+    ctx.strokeStyle = 'rgba(' + R + ',' + G + ',' + B + ',0.4)';
     ctx.lineWidth = 1;
     ctx.setLineDash([4, 4]);
     ctx.beginPath();
@@ -1840,8 +2415,8 @@ function drawHashrateGraph(history) {
     // Highlight dot
     ctx.beginPath();
     ctx.arc(hp.x, hp.y, 5, 0, 2 * Math.PI);
-    ctx.fillStyle = '#14fe17';
-    ctx.shadowColor = 'rgba(20,254,23,0.9)';
+    ctx.fillStyle = primary;
+    ctx.shadowColor = 'rgba(' + R + ',' + G + ',' + B + ',0.9)';
     ctx.shadowBlur = 12;
     ctx.fill();
     ctx.shadowBlur = 0;
@@ -1896,6 +2471,8 @@ function drawHashrateGraph(history) {
 var prevMinerKeys = '';
 var prevBlockCount = 0;
 var lastBlockCount = 0;
+var lastAccepted = -1;
+var lastRejected = -1;
 
 async function refresh() {
   try {
@@ -1905,6 +2482,17 @@ async function refresh() {
     // Header info (no flash needed)
     document.getElementById('blockHeight').textContent = d.server.block_height;
     document.getElementById('stratumPort').textContent = d.server.stratum_port;
+
+    // Pulse hash background on new shares
+    if (lastAccepted >= 0 && d.stats.accepted > lastAccepted && window.hashBgPulse) {
+      window.hashBgPulse();
+    }
+    // Explode hash background on rejected share
+    if (lastRejected >= 0 && d.stats.rejected > lastRejected && window.hashBgExplode) {
+      window.hashBgExplode();
+    }
+    lastRejected = d.stats.rejected;
+    lastAccepted = d.stats.accepted;
 
     // Stat cards with flash
     updateStat('statMiners', d.stats.miners);
@@ -1927,6 +2515,9 @@ async function refresh() {
     lastBlockCount = d.stats.blocks;
 
     document.getElementById('payoutAddr').textContent = d.server.payout_address;
+    if (d.server.coin_ticker) {
+      document.getElementById('footerCoin').textContent = d.server.coin_ticker;
+    }
     if (d.server.stratum_url) {
       document.getElementById('stratumUrl').textContent = d.server.stratum_url;
       document.getElementById('stratumUrl').title = d.server.stratum_url;
@@ -2017,6 +2608,540 @@ setInterval(refresh, 2000);
 </html>
 """
 
+SETTINGS_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Server Settings - Stratum Mining Terminal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<style>
+:root {
+  --pip-green: #14fe17;
+  --pip-green-dim: #0a8f0c;
+  --pip-green-dark: #063f07;
+  --pip-bg: #0b0c0a;
+  --pip-panel: rgba(20, 254, 23, 0.05);
+  --pip-border: rgba(20, 254, 23, 0.3);
+  --pip-glow: 0 0 10px rgba(20, 254, 23, 0.3);
+  --pip-scanline: rgba(20, 254, 23, 0.03);
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background:
+    repeating-linear-gradient(0deg, transparent, transparent 3px, var(--pip-scanline) 3px, var(--pip-scanline) 4px),
+    var(--pip-bg);
+  color: var(--pip-green);
+  font-family: 'Share Tech Mono', monospace;
+  min-height: 100vh;
+  padding: 20px;
+}
+.container {
+  max-width: 720px;
+  margin: 0 auto;
+}
+.back-link {
+  color: var(--pip-green-dim);
+  text-decoration: none;
+  font-size: 13px;
+  display: inline-block;
+  margin-bottom: 12px;
+  transition: color 0.2s;
+}
+.back-link:hover { color: var(--pip-green); }
+h1 {
+  font-family: 'Orbitron', sans-serif;
+  font-size: 22px;
+  text-align: center;
+  margin-bottom: 6px;
+  text-shadow: var(--pip-glow);
+}
+.subtitle {
+  text-align: center;
+  font-size: 11px;
+  color: var(--pip-green-dim);
+  margin-bottom: 20px;
+}
+.section {
+  border: 1px solid var(--pip-border);
+  margin-bottom: 16px;
+  padding: 14px 16px;
+  background: var(--pip-panel);
+}
+.section-title {
+  font-family: 'Orbitron', sans-serif;
+  font-size: 12px;
+  letter-spacing: 2px;
+  margin-bottom: 12px;
+  text-transform: uppercase;
+  color: var(--pip-green);
+  border-bottom: 1px solid var(--pip-border);
+  padding-bottom: 6px;
+}
+.field {
+  display: flex;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.field label {
+  width: 170px;
+  font-size: 12px;
+  color: var(--pip-green-dim);
+  flex-shrink: 0;
+}
+.field input, .field select {
+  flex: 1;
+  background: rgba(0,0,0,0.5);
+  border: 1px solid var(--pip-border);
+  color: var(--pip-green);
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 13px;
+  padding: 6px 10px;
+  outline: none;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.field input:focus, .field select:focus {
+  border-color: var(--pip-green);
+  box-shadow: var(--pip-glow);
+}
+.field select { cursor: pointer; }
+.field select option { background: #111; color: var(--pip-green); }
+.pw-wrap {
+  flex: 1;
+  display: flex;
+  position: relative;
+}
+.pw-wrap input { flex: 1; padding-right: 36px; }
+.pw-toggle {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  color: var(--pip-green-dim);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 4px;
+}
+.pw-toggle:hover { color: var(--pip-green); }
+.save-area {
+  text-align: center;
+  margin-top: 20px;
+}
+.save-btn {
+  font-family: 'Orbitron', sans-serif;
+  font-size: 14px;
+  letter-spacing: 3px;
+  padding: 12px 40px;
+  background: transparent;
+  border: 2px solid var(--pip-green);
+  color: var(--pip-green);
+  cursor: pointer;
+  text-transform: uppercase;
+  transition: background 0.2s, box-shadow 0.2s;
+}
+.save-btn:hover {
+  background: rgba(20, 254, 23, 0.1);
+  box-shadow: var(--pip-glow);
+}
+.status-msg {
+  margin-top: 12px;
+  font-size: 13px;
+  min-height: 20px;
+}
+.status-msg.ok { color: var(--pip-green); }
+.status-msg.err { color: #ff3d3d; }
+.help-toggle {
+  display: block;
+  width: 100%;
+  margin-top: 28px;
+  padding: 10px;
+  background: transparent;
+  border: 1px solid var(--pip-border);
+  color: var(--pip-green-dim);
+  font-family: 'Orbitron', sans-serif;
+  font-size: 12px;
+  letter-spacing: 2px;
+  cursor: pointer;
+  text-transform: uppercase;
+  transition: color 0.2s, border-color 0.2s;
+}
+.help-toggle:hover { color: var(--pip-green); border-color: var(--pip-green); }
+.help-content {
+  display: none;
+  border: 1px solid var(--pip-border);
+  border-top: none;
+  padding: 16px 18px;
+  background: var(--pip-panel);
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--pip-green-dim);
+}
+.help-content.open { display: block; }
+.help-content h3 {
+  font-family: 'Orbitron', sans-serif;
+  font-size: 12px;
+  color: var(--pip-green);
+  letter-spacing: 1px;
+  margin: 16px 0 6px 0;
+  border-bottom: 1px solid var(--pip-border);
+  padding-bottom: 4px;
+}
+.help-content h3:first-child { margin-top: 0; }
+.help-content code {
+  background: rgba(0,0,0,0.4);
+  padding: 1px 5px;
+  font-size: 12px;
+  color: var(--pip-green);
+}
+.help-content pre {
+  background: rgba(0,0,0,0.5);
+  border: 1px solid var(--pip-border);
+  padding: 10px 12px;
+  margin: 6px 0 10px 0;
+  overflow-x: auto;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--pip-green);
+}
+.help-content ol, .help-content ul { margin: 6px 0 10px 20px; }
+.help-content li { margin-bottom: 4px; }
+.help-content .note {
+  border-left: 3px solid var(--pip-green-dim);
+  padding: 6px 10px;
+  margin: 8px 0;
+  background: rgba(0,0,0,0.3);
+}
+</style>
+<script>
+var THEMES_INIT = {
+  green:  { primary: '#14fe17', dim: '#0a8f0c', dark: '#063f07' },
+  amber:  { primary: '#ffb000', dim: '#8f6a00', dark: '#3f2f00' },
+  cyan:   { primary: '#00d4ff', dim: '#007a8f', dark: '#003540' },
+  red:    { primary: '#ff3d3d', dim: '#8f2222', dark: '#3f0f0f' },
+  violet: { primary: '#b44aff', dim: '#6a2e8f', dark: '#2f1440' },
+  white:  { primary: '#e0e0e0', dim: '#808080', dark: '#404040' }
+};
+function setThemeVars(name) {
+  var c = THEMES_INIT[name] || THEMES_INIT.green;
+  function hexToRgb(h) {
+    var r = parseInt(h.slice(1,3),16), g = parseInt(h.slice(3,5),16), b = parseInt(h.slice(5,7),16);
+    return r+','+g+','+b;
+  }
+  var s = document.documentElement.style;
+  s.setProperty('--pip-green', c.primary);
+  s.setProperty('--pip-green-dim', c.dim);
+  s.setProperty('--pip-green-dark', c.dark);
+  s.setProperty('--pip-panel', 'rgba('+hexToRgb(c.primary)+',0.05)');
+  s.setProperty('--pip-border', 'rgba('+hexToRgb(c.primary)+',0.3)');
+  s.setProperty('--pip-glow', '0 0 10px rgba('+hexToRgb(c.primary)+',0.3)');
+  s.setProperty('--pip-scanline', 'rgba('+hexToRgb(c.primary)+',0.03)');
+}
+// Apply localStorage immediately (no flash), then override from server if different
+var _initTheme = (function(){ try { return localStorage.getItem('caps-theme'); } catch(e) { return null; } })() || 'green';
+setThemeVars(_initTheme);
+</script>
+</head>
+<body>
+<div class="container">
+  <a href="/" class="back-link">&larr; Back to Dashboard</a>
+  <h1>SERVER SETTINGS</h1>
+  <div class="subtitle">STRATUM MINING SERVICES CONFIGURATION</div>
+
+  <div class="section">
+    <div class="section-title">Coin Preset</div>
+    <div class="field">
+      <label>Load Preset</label>
+      <select id="presetSelect">
+        <option value="">-- Custom --</option>
+        <option value="caps">Caps</option>
+        <option value="bitcoin">Bitcoin</option>
+        <option value="bitcoin_cash">Bitcoin Cash</option>
+        <option value="namecoin">Namecoin</option>
+        <option value="peercoin">Peercoin</option>
+        <option value="digibyte">DigiByte</option>
+        <option value="bitcoin_ii">Bitcoin II</option>
+        <option value="bitcoin_silver">Bitcoin Silver</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Coin</div>
+    <div class="field"><label>Coin Name</label><input id="coin_name" type="text"></div>
+    <div class="field"><label>Ticker Symbol</label><input id="coin_ticker" type="text"></div>
+    <div class="field"><label>Bech32 HRP</label><input id="bech32_hrp" type="text" placeholder="e.g. caps, bc (leave empty if none)"></div>
+    <div class="field"><label>P2PKH Version</label><input id="p2pkh_version" type="number" min="0" max="255"></div>
+    <div class="field"><label>P2SH Version</label><input id="p2sh_version" type="number" min="0" max="255"></div>
+    <div class="field"><label>Coinbase Message</label><input id="coinbase_message" type="text"></div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Network / RPC</div>
+    <div class="field"><label>RPC Host</label><input id="rpc_host" type="text"></div>
+    <div class="field"><label>RPC Port</label><input id="rpc_port" type="number" min="1" max="65535"></div>
+    <div class="field"><label>RPC User</label><input id="rpc_user" type="text"></div>
+    <div class="field">
+      <label>RPC Password</label>
+      <div class="pw-wrap">
+        <input id="rpc_password" type="password" placeholder="(unchanged)">
+        <button class="pw-toggle" id="pwToggle" type="button" title="Show/Hide">&#128065;</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Mining</div>
+    <div class="field"><label>Payout Address</label><input id="payout_address" type="text"></div>
+    <div class="field"><label>Stratum Port</label><input id="stratum_port" type="number" min="1" max="65535"></div>
+    <div class="field"><label>Default Difficulty</label><input id="difficulty" type="text"></div>
+    <div class="field"><label>Poll Interval (sec)</label><input id="poll_interval" type="number" min="1"></div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Dashboard</div>
+    <div class="field"><label>Dashboard Port</label><input id="dashboard_port" type="number" min="1" max="65535"></div>
+  </div>
+
+  <div class="save-area">
+    <button class="save-btn" id="saveBtn">SAVE &amp; RESTART</button>
+    <div class="status-msg" id="statusMsg"></div>
+  </div>
+
+  <button class="help-toggle" id="helpToggle">&#9881; SETUP GUIDE &#9660;</button>
+  <div class="help-content" id="helpContent">
+
+    <h3>Quick Start</h3>
+    <ol>
+      <li>Install and fully sync a coin node (e.g. <code>capsd</code>, <code>bitcoind</code>, <code>digibyted</code>)</li>
+      <li>Enable RPC in the node's config file (see examples below)</li>
+      <li>Select the matching <strong>Coin Preset</strong> above to fill in address parameters</li>
+      <li>Enter your node's <strong>RPC credentials</strong> (host, port, user, password)</li>
+      <li>Set your <strong>Payout Address</strong> &mdash; this is where mined coins go</li>
+      <li>Click <strong>SAVE &amp; RESTART</strong></li>
+    </ol>
+
+    <h3>Node Config File</h3>
+    <p>Each coin node needs RPC enabled. Edit the node's config file and add:</p>
+    <pre>server=1
+rpcuser=your_rpc_username
+rpcpassword=your_rpc_password
+rpcallowip=127.0.0.1
+rpcport=10567</pre>
+
+    <p>Config file locations by OS:</p>
+    <ul>
+      <li><strong>Windows:</strong> <code>%APPDATA%\CoinName\coinname.conf</code></li>
+      <li><strong>Linux:</strong> <code>~/.coinname/coinname.conf</code></li>
+      <li><strong>macOS:</strong> <code>~/Library/Application Support/CoinName/coinname.conf</code></li>
+    </ul>
+
+    <h3>Config Examples by Coin</h3>
+
+    <p><strong>Caps</strong> &mdash; <code>caps.conf</code> (default data dir: <code>Caps</code>)</p>
+    <pre>server=1
+rpcuser=myuser
+rpcpassword=mypassword
+rpcallowip=127.0.0.1
+rpcport=10567</pre>
+
+    <p><strong>Bitcoin</strong> &mdash; <code>bitcoin.conf</code> (default data dir: <code>Bitcoin</code>)</p>
+    <pre>server=1
+rpcuser=myuser
+rpcpassword=mypassword
+rpcallowip=127.0.0.1
+rpcport=8332</pre>
+
+    <p><strong>Bitcoin Cash</strong> &mdash; <code>bitcoin.conf</code> (default data dir: <code>Bitcoin</code>)</p>
+    <pre>server=1
+rpcuser=myuser
+rpcpassword=mypassword
+rpcallowip=127.0.0.1
+rpcport=8332</pre>
+    <div class="note">BCH addresses can use CashAddr format (<code>bitcoincash:qr...</code>) or legacy Base58 format. Both are supported.</div>
+
+    <p><strong>Namecoin</strong> &mdash; <code>namecoin.conf</code> (default data dir: <code>Namecoin</code>)</p>
+    <pre>server=1
+rpcuser=myuser
+rpcpassword=mypassword
+rpcallowip=127.0.0.1
+rpcport=8336</pre>
+
+    <p><strong>Peercoin</strong> &mdash; <code>peercoin.conf</code> (default data dir: <code>Peercoin</code>)</p>
+    <pre>server=1
+rpcuser=myuser
+rpcpassword=mypassword
+rpcallowip=127.0.0.1
+rpcport=9902</pre>
+
+    <p><strong>DigiByte</strong> &mdash; <code>digibyte.conf</code> (default data dir: <code>DigiByte</code>)</p>
+    <pre>server=1
+rpcuser=myuser
+rpcpassword=mypassword
+rpcallowip=127.0.0.1
+rpcport=14022
+algo=sha256d</pre>
+    <div class="note">DigiByte is multi-algo. Make sure your node and miners are configured for the SHA-256d algorithm.</div>
+
+    <p><strong>Bitcoin II</strong> &mdash; <code>bitcoin2.conf</code> (default data dir: <code>BitcoinII</code>)</p>
+    <pre>server=1
+rpcuser=myuser
+rpcpassword=mypassword
+rpcallowip=127.0.0.1
+rpcport=8337</pre>
+    <div class="note">Bitcoin II uses the same address format as Bitcoin (bc1... / 1... / 3...). Double-check you are using a BC2 address, not a BTC address.</div>
+
+    <p><strong>Bitcoin Silver</strong> &mdash; <code>bitcoinsilver.conf</code> (default data dir: <code>BitcoinSilver</code>)</p>
+    <pre>server=1
+rpcuser=myuser
+rpcpassword=mypassword
+rpcallowip=127.0.0.1
+rpcport=10567</pre>
+
+    <h3>Custom / Unlisted Coins</h3>
+    <p>Any SHA-256d coin with a Bitcoin-compatible RPC interface will work. To find the right values for a coin not listed above:</p>
+    <ol>
+      <li>Look in the coin's <code>src/chainparams.cpp</code> or <code>src/kernel/chainparams.cpp</code> on GitHub</li>
+      <li>Find <code>base58Prefixes[PUBKEY_ADDRESS]</code> &rarr; this is the <strong>P2PKH Version</strong> byte</li>
+      <li>Find <code>base58Prefixes[SCRIPT_ADDRESS]</code> &rarr; this is the <strong>P2SH Version</strong> byte</li>
+      <li>Find <code>bech32_hrp</code> &rarr; this is the <strong>Bech32 HRP</strong> (leave empty if the coin has no segwit)</li>
+      <li>Find the RPC port in <code>src/chainparamsbase.cpp</code></li>
+    </ol>
+
+    <h3>Connecting Miners</h3>
+    <p>Point your miners at:</p>
+    <pre>stratum+tcp://YOUR_IP:STRATUM_PORT</pre>
+    <p>The exact URL is shown on the dashboard. For miners on the same machine, use <code>127.0.0.1</code>. For LAN miners, use your computer's local IP. Any worker name and password will be accepted.</p>
+
+    <h3>Troubleshooting</h3>
+    <ul>
+      <li><strong>"Cannot connect to node RPC"</strong> &mdash; Check that the node is running, fully synced, and RPC is enabled with matching credentials</li>
+      <li><strong>"Failed to get block template"</strong> &mdash; The node may still be syncing. Wait until it catches up to the chain tip</li>
+      <li><strong>Miners connect but get no work</strong> &mdash; Verify the payout address is valid for the selected coin</li>
+      <li><strong>Address decode error</strong> &mdash; Make sure Bech32 HRP and version bytes match the coin. Use a preset if available</li>
+    </ul>
+
+  </div>
+</div>
+
+<script>
+var PRESETS = {
+  caps:         { coin_name:'Caps',         coin_ticker:'CAPS', bech32_hrp:'caps', p2pkh_version:28,  p2sh_version:29,  rpc_port:10567, stratum_port:10333, coinbase_message:'/Caps Stratum Pool/' },
+  bitcoin:      { coin_name:'Bitcoin',      coin_ticker:'BTC',  bech32_hrp:'bc',   p2pkh_version:0,   p2sh_version:5,   rpc_port:8332,  stratum_port:3333,  coinbase_message:'/Stratum Pool/' },
+  bitcoin_cash: { coin_name:'Bitcoin Cash', coin_ticker:'BCH',  bech32_hrp:'',     p2pkh_version:0,   p2sh_version:5,   rpc_port:8332,  stratum_port:3333,  coinbase_message:'/Stratum Pool/' },
+  namecoin:     { coin_name:'Namecoin',     coin_ticker:'NMC',  bech32_hrp:'nc',   p2pkh_version:52,  p2sh_version:13,  rpc_port:8336,  stratum_port:3335,  coinbase_message:'/Stratum Pool/' },
+  peercoin:     { coin_name:'Peercoin',     coin_ticker:'PPC',  bech32_hrp:'',     p2pkh_version:55,  p2sh_version:117, rpc_port:9902,  stratum_port:3336,  coinbase_message:'/Stratum Pool/' },
+  digibyte:     { coin_name:'DigiByte',     coin_ticker:'DGB',  bech32_hrp:'dgb',  p2pkh_version:30,  p2sh_version:63,  rpc_port:14022, stratum_port:8881,  coinbase_message:'/Stratum Pool/' },
+  bitcoin_ii:   { coin_name:'Bitcoin II',   coin_ticker:'BC2',  bech32_hrp:'bc',   p2pkh_version:0,   p2sh_version:5,   rpc_port:8337,  stratum_port:7041,  coinbase_message:'/Stratum Pool/' },
+  bitcoin_silver:{ coin_name:'Bitcoin Silver',coin_ticker:'BTCS', bech32_hrp:'bs',  p2pkh_version:26,  p2sh_version:5,   rpc_port:10567, stratum_port:3334,  coinbase_message:'/Stratum Pool/' }
+};
+
+var FIELDS = ['coin_name','coin_ticker','bech32_hrp','p2pkh_version','p2sh_version','coinbase_message',
+              'rpc_host','rpc_port','rpc_user','rpc_password','payout_address','stratum_port',
+              'difficulty','poll_interval','dashboard_port'];
+var passwordOriginal = '';
+
+function setField(id, val) {
+  var el = document.getElementById(id);
+  if (el) el.value = (val === null || val === undefined) ? '' : val;
+}
+function getField(id) { var el = document.getElementById(id); return el ? el.value : ''; }
+
+// Load current config
+fetch('/api/config').then(function(r){ return r.json(); }).then(function(cfg){
+  FIELDS.forEach(function(f){
+    if (f === 'rpc_password') {
+      passwordOriginal = cfg.rpc_password || '';
+      setField('rpc_password', cfg.rpc_password_set ? '****' : '');
+    } else {
+      setField(f, cfg[f]);
+    }
+  });
+});
+
+// Sync theme from server (override localStorage if server has a saved preference)
+fetch('/api/preferences').then(function(r){return r.json();}).then(function(p){
+  if (p.theme && p.theme !== _initTheme) {
+    setThemeVars(p.theme);
+    try { localStorage.setItem('caps-theme', p.theme); } catch(e) {}
+  }
+}).catch(function(){});
+
+// Preset selector
+document.getElementById('presetSelect').addEventListener('change', function(){
+  var p = PRESETS[this.value];
+  if (!p) return;
+  ['coin_name','coin_ticker','bech32_hrp','p2pkh_version','p2sh_version','coinbase_message','rpc_port','stratum_port'].forEach(function(f){
+    setField(f, p[f]);
+  });
+});
+
+// Password show/hide toggle
+document.getElementById('pwToggle').addEventListener('click', function(){
+  var inp = document.getElementById('rpc_password');
+  inp.type = inp.type === 'password' ? 'text' : 'password';
+});
+
+// Help toggle
+document.getElementById('helpToggle').addEventListener('click', function(){
+  var content = document.getElementById('helpContent');
+  var open = content.classList.toggle('open');
+  this.innerHTML = open ? '&#9881; SETUP GUIDE &#9650;' : '&#9881; SETUP GUIDE &#9660;';
+});
+
+// Save
+document.getElementById('saveBtn').addEventListener('click', function(){
+  var msg = document.getElementById('statusMsg');
+  msg.className = 'status-msg';
+  msg.textContent = 'Saving...';
+
+  var data = {};
+  FIELDS.forEach(function(f){ data[f] = getField(f); });
+  // Coerce numeric fields
+  ['rpc_port','stratum_port','dashboard_port','p2pkh_version','p2sh_version','poll_interval'].forEach(function(f){
+    if (data[f] !== '') data[f] = parseInt(data[f], 10);
+  });
+  if (data.difficulty !== '') data.difficulty = parseFloat(data.difficulty);
+
+  // Client-side validation
+  var errors = [];
+  if (!data.rpc_host) errors.push('RPC Host is required');
+  if (!data.rpc_port) errors.push('RPC Port is required');
+  if (!data.rpc_user) errors.push('RPC User is required');
+  if (!data.payout_address) errors.push('Payout Address is required');
+  if (errors.length) {
+    msg.className = 'status-msg err';
+    msg.textContent = errors.join('; ');
+    return;
+  }
+
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(data)
+  }).then(function(r){ return r.json().then(function(j){ return {ok:r.ok, body:j}; }); })
+    .then(function(res){
+      if (res.ok) {
+        msg.className = 'status-msg ok';
+        msg.textContent = 'Settings saved! Restarting server...';
+        setTimeout(function(){ window.location.href = '/'; }, 5000);
+      } else {
+        msg.className = 'status-msg err';
+        msg.textContent = (res.body.errors || ['Unknown error']).join('; ');
+      }
+    })
+    .catch(function(e){
+      msg.className = 'status-msg err';
+      msg.textContent = 'Network error: ' + e.message;
+    });
+});
+</script>
+</body>
+</html>
+"""
+
 
 # ---------------------------------------------------------------------------
 # SQLite persistence
@@ -2077,6 +3202,12 @@ class StratumDB:
                 total_blocks    INTEGER NOT NULL DEFAULT 0
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS preferences (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
         # Ensure the single stats row exists
         c.execute("INSERT OR IGNORE INTO pool_stats (id, total_accepted, total_rejected, total_blocks) VALUES (1,0,0,0)")
         c.commit()
@@ -2123,7 +3254,24 @@ class StratumDB:
         self._conn.execute("DELETE FROM hashrate_samples WHERE timestamp < ?", (now - hashrate_days * 86400,))
         self._conn.commit()
 
+    def _set_preference(self, key, value):
+        self._conn.execute(
+            "INSERT OR REPLACE INTO preferences (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        self._conn.commit()
+
     # -- read helpers -------------------------------------------------------
+
+    def load_preferences(self):
+        rows = self._conn.execute("SELECT key, value FROM preferences").fetchall()
+        return {r[0]: r[1] for r in rows}
+
+    def get_preference(self, key, default=None):
+        row = self._conn.execute(
+            "SELECT value FROM preferences WHERE key = ?", (key,)
+        ).fetchone()
+        return row[0] if row else default
 
     def load_pool_stats(self):
         row = self._conn.execute(
@@ -2172,6 +3320,10 @@ class StratumDB:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(self._executor, self._cleanup_old_data)
 
+    async def set_preference(self, key, value):
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(self._executor, self._set_preference, key, value)
+
 
 # ---------------------------------------------------------------------------
 # Stratum Server
@@ -2200,10 +3352,21 @@ class StratumServer:
             "tolerance": vd.get("tolerance", 0.3),
         }
 
+        # Coin-specific settings (backward-compatible defaults for Caps)
+        self.coin_name = config.get("coin_name", "Caps")
+        self.coin_ticker = config.get("coin_ticker", "CAPS")
+        self.bech32_hrp = config.get("bech32_hrp", "caps")
+        self.p2pkh_version = config.get("p2pkh_version", 28)
+        self.p2sh_version = config.get("p2sh_version", 29)
+        self.coinbase_message = config.get("coinbase_message", "/Caps Stratum Pool/")
+
         # BIP 310 version rolling — server-allowed mask
         self.allowed_version_mask = int(config.get("version_rolling_mask", "1fffe000"), 16)
 
-        self.payout_script = address_to_script(self.payout_address)
+        self.payout_script = address_to_script(
+            self.payout_address, self.bech32_hrp,
+            self.p2pkh_version, self.p2sh_version
+        )
         self.extranonce1_size = 4
 
         self.miners: list[MinerSession] = []
@@ -2244,6 +3407,22 @@ class StratumServer:
             return ip
         except Exception:
             return "127.0.0.1"
+
+    def _request_restart(self):
+        """Schedule a server restart after a short delay (let HTTP response flush).
+
+        The launcher's monitor loop will auto-restart the process.
+        When running directly (not via launcher), the process just exits.
+        """
+        import threading
+
+        def _do_restart():
+            time.sleep(1)
+            log.info("Restarting server (settings changed)...")
+            os._exit(0)
+
+        t = threading.Thread(target=_do_restart, daemon=True)
+        t.start()
 
     async def _run_forever(self, name, coro_func):
         """Run an async task forever, restarting on error."""
@@ -2303,11 +3482,12 @@ class StratumServer:
             self.current_job.curtime = template["curtime"]
             return False
 
-        log.info("New block template: height=%d, txs=%d, value=%.8f CAPS",
+        log.info("New block template: height=%d, txs=%d, value=%.8f %s",
                  new_height, len(template.get("transactions", [])),
-                 template["coinbasevalue"] / 1e8)
+                 template["coinbasevalue"] / 1e8, self.coin_ticker)
 
-        job = Job(template, self.payout_script, self.extranonce1_size)
+        job = Job(template, self.payout_script, self.extranonce1_size,
+                  self.coinbase_message)
         self.current_job = job
         self.current_prev_hash = new_prev
 
@@ -2445,11 +3625,11 @@ class StratumServer:
         # Test RPC connection
         info = self.rpc.call("getblockchaininfo")
         if info is None:
-            log.error("Cannot connect to Caps node RPC. Is the node running?")
+            log.error("Cannot connect to %s node RPC. Is the node running?", self.coin_name)
             log.error("Check rpc_host, rpc_port, rpc_user, rpc_password in config.json")
             return
 
-        log.info("Connected to Caps node: chain=%s, blocks=%d",
+        log.info("Connected to %s node: chain=%s, blocks=%d", self.coin_name,
                  info.get("chain", "?"), info.get("blocks", 0))
 
         # Restore persisted stats from SQLite
@@ -2509,24 +3689,122 @@ class StratumServer:
         stratum_server = self  # capture for the handler closure
 
         class Handler(http.server.BaseHTTPRequestHandler):
+            def _send_json(self, code, data):
+                body = json.dumps(data).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _send_html(self, html):
+                body = html.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
             def do_GET(self):
                 if self.path == "/api/stats":
-                    body = json.dumps(stratum_server._get_dashboard_data()).encode()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-                    self.wfile.write(body)
+                    self._send_json(200, stratum_server._get_dashboard_data())
+                elif self.path == "/api/config":
+                    try:
+                        cfg = load_config()
+                    except Exception:
+                        cfg = {}
+                    # Fill defaults for new fields
+                    defaults = {
+                        "coin_name": "Caps", "coin_ticker": "CAPS",
+                        "bech32_hrp": "caps", "p2pkh_version": 28,
+                        "p2sh_version": 29, "coinbase_message": "/Caps Stratum Pool/",
+                        "rpc_host": "127.0.0.1", "rpc_port": 10567,
+                        "rpc_user": "", "payout_address": "",
+                        "stratum_port": 10333, "dashboard_port": 8080,
+                        "difficulty": 0.001, "poll_interval": 15,
+                    }
+                    for k, v in defaults.items():
+                        cfg.setdefault(k, v)
+                    # Mask password
+                    has_pw = bool(cfg.get("rpc_password"))
+                    cfg["rpc_password"] = "****" if has_pw else ""
+                    cfg["rpc_password_set"] = has_pw
+                    self._send_json(200, cfg)
+                elif self.path == "/api/preferences":
+                    self._send_json(200, stratum_server.db.load_preferences())
+                elif self.path == "/settings":
+                    self._send_html(SETTINGS_HTML)
                 elif self.path == "/":
-                    body = DASHBOARD_HTML.encode()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-                    self.wfile.write(body)
+                    self._send_html(DASHBOARD_HTML)
+                else:
+                    self.send_error(404)
+
+            def do_POST(self):
+                if self.path == "/api/settings":
+                    try:
+                        length = int(self.headers.get("Content-Length", 0))
+                        raw = self.rfile.read(length)
+                        data = json.loads(raw.decode("utf-8"))
+                    except Exception:
+                        self._send_json(400, {"errors": ["Invalid JSON body"]})
+                        return
+
+                    errors = validate_settings(data)
+                    if errors:
+                        self._send_json(400, {"errors": errors})
+                        return
+
+                    # Preserve existing password if masked or empty
+                    pw = data.get("rpc_password", "")
+                    if pw == "****" or pw == "":
+                        try:
+                            existing = load_config()
+                            data["rpc_password"] = existing.get("rpc_password", "")
+                        except Exception:
+                            pass
+
+                    # Coerce types for config.json
+                    for k in ("rpc_port", "stratum_port", "dashboard_port",
+                              "p2pkh_version", "p2sh_version", "poll_interval"):
+                        if k in data and data[k] != "":
+                            try:
+                                data[k] = int(data[k])
+                            except (ValueError, TypeError):
+                                pass
+                    if "difficulty" in data and data["difficulty"] != "":
+                        try:
+                            data["difficulty"] = float(data["difficulty"])
+                        except (ValueError, TypeError):
+                            pass
+
+                    # Remove transient keys
+                    data.pop("rpc_password_set", None)
+
+                    try:
+                        with open(CONFIG_PATH, "w") as f:
+                            json.dump(data, f, indent=2)
+                    except Exception as e:
+                        self._send_json(500, {"errors": [f"Failed to write config: {e}"]})
+                        return
+
+                    self._send_json(200, {"ok": True})
+                    stratum_server._request_restart()
+                elif self.path == "/api/preferences":
+                    try:
+                        length = int(self.headers.get("Content-Length", 0))
+                        raw = self.rfile.read(length)
+                        data = json.loads(raw.decode("utf-8"))
+                    except Exception:
+                        self._send_json(400, {"error": "Invalid JSON"})
+                        return
+                    allowed = {"theme"}
+                    for key, value in data.items():
+                        if key in allowed and isinstance(value, str) and len(value) < 64:
+                            stratum_server.db._set_preference(key, value)
+                    self._send_json(200, {"ok": True})
                 else:
                     self.send_error(404)
 
@@ -2581,6 +3859,7 @@ class StratumServer:
                 "block_height": block_height,
                 "local_ip": self._cached_local_ip,
                 "stratum_url": f"stratum+tcp://{self._cached_local_ip}:{self.listen_port}",
+                "coin_ticker": self.coin_ticker,
             },
             "stats": {
                 "miners": len(miners_list),

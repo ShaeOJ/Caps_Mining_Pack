@@ -7,5 +7,11 @@
   "stratum_port": 10333,
   "dashboard_port": 8080,
   "difficulty": 0.001,
-  "poll_interval": 15
+  "poll_interval": 15,
+  "coin_name": "Caps",
+  "coin_ticker": "CAPS",
+  "bech32_hrp": "caps",
+  "p2pkh_version": 28,
+  "p2sh_version": 29,
+  "coinbase_message": "/Caps Stratum Pool/"
 }
