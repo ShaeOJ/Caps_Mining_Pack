@@ -580,6 +580,9 @@ class MinerSession:
         self.vardiff_share_times = []      # timestamps of recent shares for rate calculation
         self.vardiff_last_retarget = time.time()
         self.vardiff_frozen_until = 0      # if miner used suggest_difficulty, freeze vardiff temporarily
+        self.prev_difficulty = None        # previous diff for grace period after retarget
+        self.diff_change_time = 0          # when difficulty last changed
+        self._suggested_difficulty = None  # buffered suggest_difficulty before subscribe
 
     @staticmethod
     def _extract_json_objects(line: str) -> list:
@@ -621,9 +624,9 @@ class MinerSession:
             buffer = ""
             while True:
                 try:
-                    data = await asyncio.wait_for(self.reader.read(4096), timeout=60)
+                    data = await asyncio.wait_for(self.reader.read(4096), timeout=300)
                 except asyncio.TimeoutError:
-                    log.info("Miner %s read timeout (60s idle), disconnecting", self.worker_name)
+                    log.info("Miner %s read timeout (300s idle), disconnecting", self.worker_name)
                     break
                 if not data:
                     break
@@ -720,9 +723,16 @@ class MinerSession:
         self.user_agent = params[0] if params else "unknown"
         log.info("Miner subscribed: %s (agent: %s)", self.addr, self.user_agent)
 
-        # Pick difficulty based on miner type
-        self.difficulty = self._pick_difficulty(self.user_agent)
-        log.info("Setting difficulty %s for %s", self.difficulty, self.user_agent)
+        # Use buffered suggest_difficulty if the miner sent it before subscribe,
+        # otherwise pick based on user agent.
+        if self._suggested_difficulty is not None:
+            self.difficulty = self._suggested_difficulty
+            self.vardiff_frozen_until = time.time() + 300
+            self._suggested_difficulty = None
+            log.info("Using suggested difficulty %s for %s", self.difficulty, self.user_agent)
+        else:
+            self.difficulty = self._pick_difficulty(self.user_agent)
+            log.info("Setting difficulty %s for %s", self.difficulty, self.user_agent)
 
         result = [
             [
@@ -746,6 +756,15 @@ class MinerSession:
         if params and isinstance(params[0], (int, float)) and params[0] > 0:
             cfg = self.server.vardiff_config
             suggested = max(cfg["min_diff"], min(cfg["max_diff"], params[0]))
+            if not self.subscribed:
+                # Buffer it — will be applied in handle_subscribe.
+                # Don't send set_difficulty before subscribe or NerdMiners hang.
+                self._suggested_difficulty = suggested
+                log.info("Miner %s buffered suggest_difficulty %s (pre-subscribe)",
+                         self.worker_name, suggested)
+                return
+            self.prev_difficulty = self.difficulty
+            self.diff_change_time = time.time()
             self.difficulty = suggested
             self.vardiff_frozen_until = time.time() + 300  # freeze vardiff for 5 min
             log.info("Miner %s suggested difficulty %s, accepted (vardiff frozen 5m)",
@@ -796,7 +815,9 @@ class MinerSession:
         # Clamp to bounds
         new_diff = max(cfg["min_diff"], min(cfg["max_diff"], new_diff))
 
-        # Apply
+        # Apply — keep previous diff for grace period
+        self.prev_difficulty = self.difficulty
+        self.diff_change_time = now
         self.difficulty = new_diff
         self.vardiff_last_retarget = now
         self.vardiff_share_times.clear()
@@ -808,6 +829,10 @@ class MinerSession:
         Standard:        [worker, job_id, extranonce2, ntime, nonce]
         Version-rolling: [worker, job_id, extranonce2, ntime, nonce, version]
         """
+        if not self.authorized:
+            await self.send_result(msg_id, None, [24, "Unauthorized worker", None])
+            return
+
         if len(params) < 5:
             await self.send_result(msg_id, None, [20, "Invalid parameters", None])
             return
@@ -875,9 +900,18 @@ class MinerSession:
             await self.send_result(msg_id, None, [20, "Internal error", None])
             return
 
-        # Check share meets the miner's difficulty target
+        # Check share meets the miner's difficulty target.
+        # After a difficulty change, allow a 10s grace period where we also
+        # accept shares at the previous (typically lower) difficulty — the
+        # miner may have been working on those before it received the update.
         share_target = self.server.diff_to_target(self.difficulty)
-        if hash_int > share_target:
+        share_ok = hash_int <= share_target
+        if not share_ok and self.prev_difficulty is not None:
+            grace = time.time() - self.diff_change_time
+            if grace < 10:
+                prev_target = self.server.diff_to_target(self.prev_difficulty)
+                share_ok = hash_int <= prev_target
+        if not share_ok:
             self.server.stats["rejected"] += 1
             self.shares_rejected += 1
             await self.send_result(msg_id, None, [23, "Low difficulty share", None])
@@ -2516,6 +2550,8 @@ class StratumServer:
 
         miners_list = []
         for m in self.miners:
+            if not m.authorized:
+                continue  # hide miners that haven't completed handshake
             connected_secs = int(now - m.connected_at)
             ch, cr = divmod(connected_secs, 3600)
             cm, cs = divmod(cr, 60)
@@ -2547,7 +2583,7 @@ class StratumServer:
                 "stratum_url": f"stratum+tcp://{self._cached_local_ip}:{self.listen_port}",
             },
             "stats": {
-                "miners": len(self.miners),
+                "miners": len(miners_list),
                 "accepted": self.stats["accepted"],
                 "rejected": self.stats["rejected"],
                 "blocks": self.stats["blocks"],

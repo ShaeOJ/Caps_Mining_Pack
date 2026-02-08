@@ -7,13 +7,5 @@
   "stratum_port": 10333,
   "dashboard_port": 8080,
   "difficulty": 0.001,
-  "poll_interval": 15,
-  "vardiff": {
-    "min_diff": 0.0001,
-    "max_diff": 65536,
-    "target_shares_per_min": 6,
-    "retarget_interval": 90,
-    "tolerance": 0.3
-  },
-  "version_rolling_mask": "1fffe000"
+  "poll_interval": 15
 }
