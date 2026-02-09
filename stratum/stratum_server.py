@@ -3017,6 +3017,11 @@ rpcport=10567</pre>
 
     <h3>Troubleshooting</h3>
     <ul>
+      <li><strong>Miner can't connect to stratum</strong> &mdash; This is almost always <strong>Windows Firewall</strong> blocking the port. Open an <strong>Administrator</strong> command prompt and run:
+        <pre>netsh advfirewall firewall add rule name="Stratum Mining" dir=in action=allow protocol=TCP localport=10333</pre>
+        Replace <code>10333</code> with your stratum port. You may also need to allow the dashboard port (default <code>8080</code>):
+        <pre>netsh advfirewall firewall add rule name="Stratum Dashboard" dir=in action=allow protocol=TCP localport=8080</pre>
+      </li>
       <li><strong>"Cannot connect to node RPC"</strong> &mdash; Check that the node is running, fully synced, and RPC is enabled with matching credentials</li>
       <li><strong>"Failed to get block template"</strong> &mdash; The node may still be syncing. Wait until it catches up to the chain tip</li>
       <li><strong>Miners connect but get no work</strong> &mdash; Verify the payout address is valid for the selected coin</li>
@@ -3660,15 +3665,37 @@ class StratumServer:
             self.handle_client, "0.0.0.0", self.listen_port
         )
         log.info("Stratum server listening on port %d", self.listen_port)
-        log.info("Miners can connect to: stratum+tcp://<your-ip>:%d", self.listen_port)
+        log.info("Miners can connect to: stratum+tcp://%s:%d",
+                 self._cached_local_ip, self.listen_port)
+
+        # Show all available LAN IPs so users can try alternatives
+        try:
+            import socket as _sock
+            all_ips = []
+            for info in _sock.getaddrinfo(_sock.gethostname(), None, _sock.AF_INET):
+                ip = info[4][0]
+                if ip not in all_ips and ip != "127.0.0.1":
+                    all_ips.append(ip)
+            if len(all_ips) > 1:
+                log.info("All LAN IPs: %s (try each if miners can't connect)",
+                         ", ".join(all_ips))
+        except Exception:
+            pass
 
         # Start dashboard HTTP server on a separate thread so it never
         # competes with the asyncio event loop.
         try:
             self._start_dashboard_thread()
-            log.info("Dashboard available at: http://localhost:%d", self.dashboard_port)
+            log.info("Dashboard available at: http://%s:%d",
+                     self._cached_local_ip, self.dashboard_port)
         except OSError as e:
             log.warning("Could not start dashboard on port %d: %s", self.dashboard_port, e)
+
+        if sys.platform == "win32":
+            log.info("NOTE: If miners can't connect, check Windows Firewall.")
+            log.info("  Run as Admin: netsh advfirewall firewall add rule "
+                     'name="Stratum" dir=in action=allow protocol=TCP localport=%d',
+                     self.listen_port)
 
         log.info("=" * 60)
 
